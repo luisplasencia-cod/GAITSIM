@@ -1,0 +1,8 @@
+PROJECT_NAME = "GAITSIM Control"
+
+ESP32_PORT = None
+
+BAUDRATE = 115200
+
+VERSION = "0.1.0"
+

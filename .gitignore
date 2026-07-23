@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Raw/uncompressed source media (camera exports, uncompressed renders,
+# anything before ffmpeg compression). Convention: keep originals in a
+# sibling "source/" folder next to the in-app asset — e.g.
+# assets/videos/source/, assets/models/source/ — never committed. Only
+# the compressed/optimized derivative actually used by the app (e.g.
+# assets/videos/motion360_welcome.mp4) gets tracked. See CLAUDE.md
+# "Assets" section for the full convention and the ffmpeg command used.
+assets/*/source/
+
+# Runtime logs (src/communication/serial_manager.py, system_state.py)
+logs/
+
+# OS/editor cruft
+.DS_Store
+
+# Claude Code local machine settings (permissions allowlist, etc.)
+.claude/settings.local.json
