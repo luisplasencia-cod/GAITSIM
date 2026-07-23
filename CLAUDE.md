@@ -54,6 +54,9 @@ src/ui/screens/trajectory_screen.py — select/load/send trajectory, Run/Pause/R
 src/utils/trajectory_loader.py      — CSV -> List[TrajectoryPoint], positional column mapping
 (first 4 cols = time,pos_x,pos_y,angle; sep=";")
 src/utils/trajectory_library.py     — lists/resolves trajectories by id in data/trajectories/
+src/utils/trajectory_generator.py   — generates (doesn't load) a synchronized (0,0,0)->target
+trajectory as List[TrajectoryPoint], validated against CalibrationSpace; sent/run through the
+SAME TRAJ_BEGIN/TRAJ_POINT/TRAJ_END+RUN protocol as any CSV trajectory, no new wire commands
 ## Hard rules (violating these breaks the design intent)
 1. UI screens NEVER call ESP32Controller directly — always go through
    SystemStateMachine (via the shared bridge), which enforces
@@ -317,6 +320,77 @@ after this is verified — Luis's direction, not assumption.
 
 Consider addressing the git corruption issue (see below) before it causes
 real data loss.
+
+Git history note (2026-07-22): the corruption above was hit for real
+while linking this repo to GitHub (`github.com/luisplasencia-cod/GAITSIM`,
+remote `origin`, branch `main`) — 7 blobs from two old commits
+(`a7b28f3`, `ead9800`) were unrecoverable 0-byte objects. Per Luis's
+choice, rebuilt as a single clean root commit from the then-current
+working tree (old detailed commit history discarded from the active
+repo; full pre-rebuild `.git` backed up locally at
+`~/Projects/gaitsim-control-git-backup-20260722-231537`, not in the
+repo itself). Added `README.md` at the repo root as the onboarding
+entry point for teammates (architecture overview + per-folder guide +
+a "want to change X -> go to Y" table) — keep it in sync with this
+file's Architecture section when either changes.
+
+Implemented (2026-07-23): synchronized (0,0,0) -> initial-position
+trajectory, replacing the previous instantaneous GOTO jump right after
+calibration. Design choice: reuse the EXISTING TRAJ_BEGIN/TRAJ_POINT/
+TRAJ_END + RUN protocol (docs/protocol.md) instead of adding any new
+wire command — this generated approach trajectory is sent and executed
+exactly like a CSV-loaded gait trajectory, so it gets TRAJ_PROGRESS,
+PAUSE/RESUME/ABORT, and the test firmware's existing progressive
+simulation (handleRun()) entirely for free. Firmware: NO changes needed.
+- New `src/utils/trajectory_generator.py`:
+  `generate_synchronized_trajectory(target, calibration_space)` — all 3
+  axes (X, Y, angle) start at t=0 and reach `target` at the SAME t=T
+  (straight line in configuration space), where T is set by whichever
+  axis takes longest at its own assumed max speed
+  (`SPEED_X_CM_S`/`SPEED_Y_CM_S`/`SPEED_ANGLE_DEG_S`, sampled every
+  `WAYPOINT_INTERVAL_S` — all placeholders pending real rig
+  calibration, same spirit as `system_state.py`'s existing
+  `Y_LIFT_MARGIN_CM`/`ANGLE_HORIZONTAL_OFFSET_DEG`). Raises
+  `PositionOutOfRangeError` if `target` falls outside
+  `SystemStateMachine.CalibrationSpace` on any axis — validated BEFORE
+  anything is sent to the ESP32. Target indistinguishable from the
+  origin -> empty list, treated as a no-op (no wire traffic).
+- `connection_screen.py`: `_on_goto_position_clicked`'s `previous is
+  None` branch (the very first "Ir a Posición Inicial" after HOME) now
+  calls new `_on_goto_initial_synchronized()` — validate, generate,
+  `send_trajectory()` then `run()` — instead of plain `go_to_position()`.
+  Everything else (`safe_return_to_position()` for later
+  repositioning between trials) is UNCHANGED — different feature,
+  different safety concern (not letting Y drop below a mounted
+  prosthesis), out of scope here. Since `run()` only confirms RUNNING
+  and the real completion (FINISHED) arrives later via the shared
+  bridge `trajectory_finished` signal — which ALSO fires when
+  TrajectoryScreen's own gait-trajectory runs finish — added a guard
+  flag `_awaiting_initial_move` (+ `_pending_initial_position`) so
+  ConnectionScreen only reacts to its own move, not an unrelated one;
+  cleared on success, on a mid-move device error, and on disconnect
+  (none of those emit `trajectory_finished`, since
+  `SystemStateMachine._on_device_error`/`_on_disconnected` fall back to
+  IDLE/DISCONNECTED without it).
+- `calibration_map_window.py`: `CalibrationMapView` gained
+  `set_current_position(Position | None)` — draws a live marker (dot +
+  short line for orientation, using the same 90-angle Qt-arc mapping
+  already used for the calibration arc) on top of the existing
+  footprint rectangle/arc. `CalibrationMapWindow` feeds it from the
+  bridge's `trajectory_progress` signal — deliberately NOT scoped to
+  only this new feature, so the same marker also tracks a normal gait
+  trajectory's progress if the window happens to be open during a Run.
+Verified offscreen with a mocked controller (not just unit logic): full
+send->run->async-FINISHED chain confirmed `InitialPositionSession` ends
+up with the right position and the guard flag correctly ignores an
+unrelated `trajectory_finished`; out-of-range target confirmed to be
+rejected with NO wire traffic; `CalibrationMapWindow` with a live
+marker rendered via an offscreen screenshot without crashing (marker
+position/orientation visually correct). NOT yet run against real
+hardware — same Confirmation protocol rule applies: don't mark this
+done until verified on the Raspberry Pi + test ESP32 (calibrate ->
+enter initial point -> watch the marker move in the calibration map ->
+confirm all 3 axes arrive together).
 
 ## Deferred / not built yet (do not build unless explicitly asked)
 GUI polish (splash screen, branding), user management, pathology

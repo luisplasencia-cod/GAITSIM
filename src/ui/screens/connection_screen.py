@@ -27,7 +27,7 @@ from src.ui.style import (
     BUTTON_STYLE, BUTTON_STYLE_PRIMARY, BUTTON_STYLE_COMPACT,
     LAYOUT_SPACING, LAYOUT_MARGIN, FONT_SIZE_STATUS, FONT_SIZE_NORMAL
 )
-from src.utils import position_library
+from src.utils import position_library, trajectory_generator
 
 # Fixed manual-movement increments (cm for X/Y, degrees for A — the
 # same magnitudes read naturally in both units). Replaces a free-text
@@ -95,6 +95,14 @@ class ConnectionScreen(QWidget):
 
         # Currently selected manual-move increment (cm/deg).
         self._move_increment = MOVE_INCREMENTS[0]
+
+        # True while a synchronized (0,0,0) -> initial-position trajectory
+        # (see _on_goto_initial_synchronized) is running via send_trajectory()
+        # + run(). Guards _on_trajectory_finished so it only reacts to THIS
+        # screen's own move, not a gait trajectory finishing over on
+        # TrajectoryScreen — both arrive on the same shared bridge signal.
+        self._awaiting_initial_move = False
+        self._pending_initial_position: Position | None = None
 
         self._build_ui()
         self._connect_signals()
@@ -263,6 +271,7 @@ class ConnectionScreen(QWidget):
         self._bridge.disconnected.connect(self._on_disconnected)
         self._bridge.calibration_limit.connect(self._on_calibration_limit)
         self._bridge.calibration_progress.connect(self._on_calibration_progress)
+        self._bridge.trajectory_finished.connect(self._on_trajectory_finished)
 
     # ------------------------------------------------------------------
     # Actions
@@ -392,19 +401,74 @@ class ConnectionScreen(QWidget):
         # mounted at that height. See
         # SystemStateMachine.safe_return_to_position() for the movement
         # sequence and the safety rule. The very first GOTO after HOME
-        # has no such reference yet, so it stays a plain GOTO.
+        # has no such reference yet: instead of an instantaneous jump
+        # from the (0,0,0) origin, it uses a synchronized multi-axis
+        # trajectory (see _on_goto_initial_synchronized).
         previous = self._position_session.position
         if previous is not None:
             action_fn = lambda: self._bridge.state_machine.safe_return_to_position(
                 position, previous.y
             )
+            self._run_action(
+                action_fn,
+                success_message=f"En posición inicial: X={x:g} cm, Y={y:g} cm, Á={angle:g}°.",
+                on_success=lambda: self._on_goto_succeeded(position),
+            )
         else:
-            action_fn = lambda: self._bridge.state_machine.go_to_position(position)
+            self._on_goto_initial_synchronized(position)
 
+    def _on_goto_initial_synchronized(self, position: Position):
+        """
+        First move after HOME: reach `position` from the (0,0,0) origin
+        via a synchronized multi-axis trajectory (see
+        src/utils/trajectory_generator.py) instead of an instantaneous
+        GOTO — all 3 axes start and arrive together. Sent and executed
+        through the same TRAJ_BEGIN/TRAJ_POINT/TRAJ_END + RUN protocol
+        used for gait trajectories (see docs/protocol.md), so it gets
+        live progress (TRAJ_PROGRESS, visualized in
+        calibration_map_window.py) and pause/resume/abort for free —
+        no new wire protocol or firmware changes needed.
+        """
+        sm = self._bridge.state_machine
+        space = sm.last_calibration_space
+        if space is None:
+            self.status_label.setText(
+                "No hay datos de calibración disponibles; no se puede "
+                "validar la posición inicial."
+            )
+            return
+
+        try:
+            points = trajectory_generator.generate_synchronized_trajectory(
+                position, space
+            )
+        except trajectory_generator.PositionOutOfRangeError as exc:
+            self.status_label.setText(str(exc))
+            return
+
+        if not points:
+            # Target indistinguishable from the HOME origin: nothing to move.
+            self._on_goto_succeeded(position)
+            return
+
+        def send_and_run():
+            try:
+                result = sm.send_trajectory(points)
+                if not result.success:
+                    raise RuntimeError(
+                        f"Transferencia fallida después de "
+                        f"{result.points_acknowledged} puntos: {result.error}"
+                    )
+                sm.run()
+            except Exception:
+                self._awaiting_initial_move = False
+                raise
+
+        self._awaiting_initial_move = True
+        self._pending_initial_position = position
         self._run_action(
-            action_fn,
-            success_message=f"En posición inicial: X={x:g} cm, Y={y:g} cm, Á={angle:g}°.",
-            on_success=lambda: self._on_goto_succeeded(position),
+            send_and_run,
+            success_message="Moviendo a la posición inicial (trayectoria sincronizada)...",
         )
 
     def _on_goto_succeeded(self, position: Position):
@@ -487,10 +551,38 @@ class ConnectionScreen(QWidget):
 
     def _on_device_error(self, code: str, message: str):
         self.status_label.setText(f"Error del ESP32 [{code}]: {message}")
+        # An error during the synchronized initial move (e.g. a limit
+        # reached mid-trajectory) falls back to IDLE without ever
+        # reporting FINISHED (see SystemStateMachine._on_device_error) —
+        # clear the guard so a later, unrelated trajectory_finished isn't
+        # mistaken for this one having actually completed.
+        self._awaiting_initial_move = False
 
     def _on_disconnected(self):
         self.status_label.setText("DISCONNECTED")
+        self._awaiting_initial_move = False
         self._refresh_controls()
+
+    def _on_trajectory_finished(self):
+        """
+        Reacts only to the synchronized initial-position move started by
+        _on_goto_initial_synchronized — a gait trajectory finishing over
+        on TrajectoryScreen fires this same shared bridge signal but
+        must NOT be mistaken for this screen's own move (see
+        _awaiting_initial_move).
+        """
+        if not self._awaiting_initial_move:
+            return
+        self._awaiting_initial_move = False
+        position = self._pending_initial_position
+        self._pending_initial_position = None
+        if position is None:
+            return
+        self.status_label.setText(
+            f"En posición inicial: X={position.x:g} cm, Y={position.y:g} cm, "
+            f"Á={position.angle:g}°."
+        )
+        self._on_goto_succeeded(position)
 
     def _refresh_controls(self):
         """Enable/disable buttons based on what the state machine

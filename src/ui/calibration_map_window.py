@@ -18,15 +18,18 @@ completed this session still shows the right map immediately, not just
 newly-arriving events.
 """
 
+import math
+
 from PySide6.QtCore import Qt, QPointF, QRectF
 from PySide6.QtGui import QBrush, QColor, QPainter, QPen
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
+from src.communication.protocol import Position
 from src.controllers.system_state import CalibrationSpace
 from src.ui.bridge import StateMachineBridge
 from src.ui.style import (
     COLOR_SURFACE_ALT, COLOR_TEXT_MUTED, COLOR_AXIS_X, COLOR_AXIS_Y,
-    COLOR_AXIS_ANGLE, FONT_SIZE_NORMAL,
+    COLOR_AXIS_ANGLE, COLOR_ACCENT, FONT_SIZE_NORMAL,
 )
 
 # Spanish labels for calibration status messages, keyed by the axis
@@ -48,9 +51,18 @@ class CalibrationMapView(QWidget):
         super().__init__(parent)
         self.setMinimumSize(360, 360)
         self._space: CalibrationSpace | None = None
+        # Live platform position (x, y, angle), updated from
+        # trajectory_progress while a trajectory — including the
+        # synchronized (0,0,0) -> initial-position move — is executing.
+        # None until the first progress event arrives.
+        self._current_position: Position | None = None
 
     def set_calibration_space(self, space: CalibrationSpace | None) -> None:
         self._space = space
+        self.update()
+
+    def set_current_position(self, position: Position | None) -> None:
+        self._current_position = position
         self.update()
 
     def paintEvent(self, event):
@@ -140,6 +152,31 @@ class CalibrationMapView(QWidget):
             Qt.AlignCenter, f"{space.angle_min:.1f}° a {space.angle_max:.1f}°",
         )
 
+        # Live position marker: a dot at the platform's current (x, y)
+        # within the footprint, with a short line pointing in the
+        # current angle's direction — same 90-A Qt-angle mapping used
+        # for the reference/arc above (angle=0 -> straight up).
+        if self._current_position is not None:
+            pos = self._current_position
+            x_frac = 0.0 if x_range <= 0 else (pos.x - space.x_min) / x_range
+            y_frac = 0.0 if y_range <= 0 else (pos.y - space.y_min) / y_range
+            x_frac = min(max(x_frac, 0.0), 1.0)
+            y_frac = min(max(y_frac, 0.0), 1.0)
+            marker = QPointF(
+                rect_x + x_frac * rect_w, rect_y + rect_h - y_frac * rect_h
+            )
+
+            angle_rad = math.radians(90 - pos.angle)
+            direction = QPointF(math.cos(angle_rad), -math.sin(angle_rad))
+            tip = QPointF(
+                marker.x() + direction.x() * 22, marker.y() + direction.y() * 22
+            )
+
+            painter.setPen(QPen(QColor(COLOR_ACCENT), 2))
+            painter.drawLine(marker, tip)
+            painter.setBrush(QBrush(QColor(COLOR_ACCENT)))
+            painter.drawEllipse(marker, 7, 7)
+
         painter.end()
 
 
@@ -198,6 +235,7 @@ class CalibrationMapWindow(QWidget):
         self._bridge.calibration_limit.connect(self._on_calibration_limit)
         self._bridge.calibration_progress.connect(self._on_calibration_progress)
         self._bridge.state_changed.connect(self._on_state_changed)
+        self._bridge.trajectory_progress.connect(self._on_trajectory_progress)
 
     def _apply_space(self, space: CalibrationSpace | None) -> None:
         self._map_view.set_calibration_space(space)
@@ -228,3 +266,11 @@ class CalibrationMapWindow(QWidget):
     def _on_calibration_progress(self, axis: str, value: float):
         label = _AXIS_LABELS_ES.get(axis, axis)
         self._status_label.setText(f"Calibrando eje {label}... {value:.1f}")
+
+    def _on_trajectory_progress(self, t: float, x: float, y: float, angle: float):
+        # Fed by ANY trajectory execution (the synchronized initial-
+        # position move as well as a regular gait trajectory run) —
+        # both share the same TRAJ_PROGRESS event, so this window always
+        # shows where the platform currently is relative to the
+        # calibrated space, not just during the initial approach.
+        self._map_view.set_current_position(Position(x=x, y=y, angle=angle))

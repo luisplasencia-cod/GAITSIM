@@ -69,14 +69,14 @@ acá, en `system_state.py`.
 | `style.py` | Constantes centralizadas de estilo para interfaz táctil (tamaños, fuentes, hoja de estilos general). |
 | `main_window.py` | Ventana principal: crea y comparte la única instancia de `ESP32Controller`/`SystemStateMachine`/`Bridge`, maneja la navegación entre pantallas. Las pantallas no se conocen entre sí. |
 | `status_indicator.py` | El "foquito" circular que muestra el estado de conexión/sistema en cualquier pantalla. |
-| `calibration_map_window.py` | Ventana aparte que muestra el mapa de espacio de movimiento calculado durante el barrido de límites de un HOME. |
+| `calibration_map_window.py` | Ventana aparte que muestra el mapa de espacio de movimiento calculado durante el barrido de límites de un HOME, con un marcador en vivo (posición + orientación) que sigue a la plataforma mientras se ejecuta cualquier trayectoria. |
 | `monitor_3d_window.py` | Ventana "Monitor Posición": vista lateral 2D (no 3D pese al nombre del archivo) de la plataforma en tiempo real, actualizada por polling. |
 
 ### `src/ui/screens/` — Pantallas de la app
 | Archivo | Qué hace |
 |---|---|
 | `welcome_screen.py` | Pantalla de bienvenida (tap-to-continue) con video de fondo. |
-| `connection_screen.py` | Conectar al ESP32, Home, movimiento manual por eje, ir a posición inicial. |
+| `connection_screen.py` | Conectar al ESP32, Home, movimiento manual por eje, ir a posición inicial. El primer viaje a la posición inicial tras un HOME usa una trayectoria sincronizada (los 3 ejes llegan juntos) en vez de un salto instantáneo — ver `trajectory_generator.py` abajo. |
 | `trajectory_screen.py` | Elegir/cargar/enviar trayectoria, controles Run/Pause/Resume, gráficas en vivo, reiniciar ensayo. |
 
 **Regla estricta del proyecto**: las pantallas de `src/ui/screens/`
@@ -92,6 +92,7 @@ si no existe, hay que agregarlo ahí antes, no saltarse la capa.
 | `trajectory_loader.py` | Lee un CSV de trayectoria y lo convierte en una lista de puntos (tiempo, pos_x, pos_y, ángulo). |
 | `trajectory_library.py` | Lista y resuelve trayectorias disponibles por id, buscando en `data/trajectories/`. |
 | `position_library.py` | Guarda/lista/carga posiciones iniciales con nombre, como archivos JSON en `data/positions/`. |
+| `trajectory_generator.py` | GENERA (no carga de archivo) una trayectoria sincronizada desde `(0,0,0)` hasta un punto objetivo, validada contra el espacio calibrado (`CalibrationSpace`). Se envía y ejecuta con el mismo protocolo `TRAJ_BEGIN/TRAJ_POINT/TRAJ_END/RUN` que cualquier trayectoria de CSV — no agrega comandos nuevos al protocolo. |
 
 ### `data/` — Datos de uso de la app
 - `data/trajectories/` — CSVs de trayectorias "oficiales" que la app
@@ -154,6 +155,7 @@ tocar código, `trajectory_library.py` la detecta sola.
 | Cambiar colores/tamaños/estilo general | `src/ui/style.py` |
 | Agregar una trayectoria nueva para elegir en la app | poner el CSV en `data/trajectories/` (sin tocar código) |
 | Ver cómo se cargan/parsean los CSV de trayectoria | `src/utils/trajectory_loader.py` |
+| Cambiar cómo se calcula el movimiento sincronizado hacia la posición inicial (velocidades por eje, muestreo) | `src/utils/trajectory_generator.py` |
 | Revisar el firmware de prueba (simulador de motores) | `firmware/gaitsim-esp32-test/main.cpp` |
 | Entender el protocolo de mensajes ESP32 ↔ Raspberry Pi | `docs/protocol.md` |
 | Ver el estado de avance / decisiones de diseño recientes | `CLAUDE.md` |
