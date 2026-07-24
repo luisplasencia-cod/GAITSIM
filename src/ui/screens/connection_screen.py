@@ -601,9 +601,26 @@ class ConnectionScreen(QWidget):
         # the device from an undefined reference point with no way to
         # reflect the result in the UI (see _on_goto_succeeded).
         can_move = sm.can_move_manually() and self._position_session.position is not None
-        for button in self.axis_buttons.values():
-            button.setEnabled(can_move)
-            button.setToolTip(
-                "" if can_move else
-                "Primero presiona 'Ir a Posición Inicial'."
-            )
+        # X specifically also requires the angle to already be at
+        # ANGLE_REFERENCE_DEG (X travel is only mechanically safe
+        # there — see SystemStateMachine.move_relative()'s docstring).
+        # Compared against the LOCALLY tracked position (kept in sync
+        # by _on_manual_move_succeeded/_on_goto_succeeded), not a live
+        # GET_POSITION query — this runs on the UI thread on every
+        # state change, and a real serial round-trip here would freeze
+        # it (unlike move_relative()'s own defensive check, which runs
+        # on the background action-worker thread).
+        can_move_x = can_move and (
+            abs(self._position_session.position.angle - sm.ANGLE_REFERENCE_DEG)
+            <= sm.ANGLE_REFERENCE_TOLERANCE_DEG
+        )
+        for (axis, _direction), button in self.axis_buttons.items():
+            enabled = can_move_x if axis == "X" else can_move
+            button.setEnabled(enabled)
+            if not can_move:
+                tooltip = "Primero presiona 'Ir a Posición Inicial'."
+            elif axis == "X" and not can_move_x:
+                tooltip = "Endereza primero el ángulo (referencia) para poder mover X."
+            else:
+                tooltip = ""
+            button.setToolTip(tooltip)

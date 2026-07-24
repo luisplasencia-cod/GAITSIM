@@ -255,38 +255,89 @@ class SystemStateMachine:
         # state; the system remains IDLE before and after.
         self._controller.move_manual(axis, direction, steps)
 
+    # Tolerance (degrees) for comparing an angle against
+    # ANGLE_REFERENCE_DEG — floats, never compared with bare equality.
+    # Public: connection_screen.py's _refresh_controls compares its own
+    # locally-tracked position against this same constant to decide
+    # whether to enable the manual X buttons (see move_relative below).
+    ANGLE_REFERENCE_TOLERANCE_DEG = 1e-3
+
     def move_relative(self, axis: str, direction: str, amount: float) -> None:
         """
-        Move a single axis by a relative amount in real units (cm for
-        X/Y, degrees for A). Only allowed while IDLE, same rule as
+        Move a single axis (X, Y, or A) by a relative amount in real
+        units (cm for X/Y, degrees for A), from wherever the system
+        currently is. Only allowed while IDLE, same rule as
         move_manual().
 
+        Unlike the old instantaneous MOVE_REL-based implementation,
+        this generates a smooth single-axis trajectory (the other 2
+        axes held fixed at their current value) via
+        trajectory_generator.generate_synchronized_trajectory(), sent
+        and run through the same TRAJ_BEGIN/TRAJ_POINT/TRAJ_END + RUN
+        protocol as any other trajectory — so manual jogging is no
+        longer a teleport and gets TRAJ_PROGRESS visualization for
+        free, same as safe_return_to_position(). Blocks until the move
+        physically completes, same external contract as the old
+        implementation.
+
+        Per explicit product decision, this does NOT apply the
+        floor_y/prosthesis safety envelope (that only protects
+        automatic repositioning between trials, not free-form manual
+        jogging) — but DOES still enforce the X-axis/reference-angle
+        mechanical rule: attempting an X move while off-reference
+        raises rather than silently moving. The UI is expected to
+        disable the X buttons ahead of time by comparing its own
+        locally-tracked position's angle against ANGLE_REFERENCE_DEG
+        (see connection_screen.py's _refresh_controls) rather than
+        querying this method's check live — this check here is the
+        defense-in-depth backstop, not the primary gate the operator
+        sees.
+
         Raises:
-            InvalidTransitionError: If not currently idle.
-            Any exception ESP32Controller.move_relative() may raise.
+            InvalidTransitionError: If not currently idle, or if axis
+                is "X" and the current angle is not at
+                ANGLE_REFERENCE_DEG.
+            RuntimeError: If no CalibrationSpace is available yet (see
+                safe_return_to_position for the same requirement).
+            trajectory_generator.PositionOutOfRangeError: If the
+                resulting target would fall outside the calibrated
+                movement space.
+            Any exception send_trajectory()/run() may raise.
         """
         if not self.can_move_manually():
             raise InvalidTransitionError(
                 f"Cannot move while in state {self._state.name}."
             )
-        self._controller.move_relative(axis, direction, amount)
-
-    def go_to_position(self, position: Position) -> None:
-        """
-        Move directly to an absolute (x, y, angle) position. Only
-        allowed while IDLE. Quick and does not warrant its own
-        transient state, mirroring move_manual() — the system remains
-        IDLE before and after.
-
-        Raises:
-            InvalidTransitionError: If not currently idle.
-            Any exception ESP32Controller.go_to_position() may raise.
-        """
-        if not self.can_go_to_position():
-            raise InvalidTransitionError(
-                f"Cannot go to position while in state {self._state.name}."
+        if self.last_calibration_space is None:
+            raise RuntimeError(
+                "No hay datos de calibración disponibles; no se puede "
+                "generar una trayectoria de movimiento manual."
             )
-        self._controller.go_to_position(position)
+
+        current = self._controller.get_position()
+        if axis == "X" and abs(current.angle - self.ANGLE_REFERENCE_DEG) > self.ANGLE_REFERENCE_TOLERANCE_DEG:
+            raise InvalidTransitionError(
+                f"No se puede mover X mientras el ángulo ({current.angle:g}°) "
+                f"no esté en la referencia ({self.ANGLE_REFERENCE_DEG:g}°)."
+            )
+
+        delta = amount if direction == "+" else -amount
+        target = Position(
+            x=current.x + delta if axis == "X" else current.x,
+            y=current.y + delta if axis == "Y" else current.y,
+            angle=current.angle + delta if axis == "A" else current.angle,
+        )
+
+        # Deferred import: see safe_return_to_position for why this
+        # can't be a module-level import (circular with CalibrationSpace).
+        from src.utils import trajectory_generator
+
+        points = trajectory_generator.generate_synchronized_trajectory(
+            target, self.last_calibration_space, start=current
+        )
+        if not points:
+            return
+        self._run_trajectory_blocking(points)
 
     def get_position(self) -> Position:
         """
@@ -387,7 +438,7 @@ class SystemStateMachine:
     Y_LIFT_MARGIN_CM = 5.0
 
     # Angle used as a neutral reference orientation while traversing
-    # (see safe_return_to_position, step 2/3 below). NOT necessarily
+    # (see safe_return_to_position, steps 2/3/4 below). NOT necessarily
     # literal 0 degrees — once the real hardware's limit switches are
     # calibrated this may need to be a different reference value. Kept
     # as one named constant, not a literal, specifically so it is a
@@ -408,62 +459,110 @@ class SystemStateMachine:
         sag while X/angle are still wrong risks colliding with and
         damaging it. This is a hard safety rule, not a convenience.
 
-        Sequence, all via go_to_position() (plain GOTO — no new wire
-        protocol needed):
-            1. Lift straight up to floor_y + Y_LIFT_MARGIN_CM (or
-               whatever the mechanical limit allows — see below), X and
-               angle unchanged.
-            2. Move the angle to ANGLE_REFERENCE_DEG (a neutral reference
-               orientation, see that constant's docstring) while still
-               elevated.
-            3. Move X to the target while still elevated and at the
-               reference angle.
-            4. Rotate to the target angle while still elevated.
-            5. Only now descend to the target Y. This is the one step
-               where Y may end up below floor_y (if the target itself
-               is below it) — but by then X and angle already match
-               the target exactly, so it is a straight vertical
-               approach, not a move through the risk zone with
-               anything else still wrong.
+        Also never moves X while angle is anywhere other than
+        ANGLE_REFERENCE_DEG (a second hard mechanical rule — X travel
+        is only safe at that reference angle).
 
-        If step 1 is rejected (most likely LIMIT_REACHED near the
-        mechanical upper bound), that is not itself unsafe — the risk
-        this method guards against is Y being too LOW, not too high —
-        so the sequence continues from whatever Y was actually reached
-        instead of failing outright. Failures in steps 2-5 propagate
-        normally: by then nothing about the failure is an expected
-        "already at the limit" situation.
+        Implementation: generates a single smooth trajectory
+        (trajectory_generator.generate_safe_return_trajectory)
+        preserving the EXACT SAME 5-step ordering as the original
+        step-wise version — lift Y clear of `floor_y`, rotate to
+        ANGLE_REFERENCE_DEG, move X, rotate to the target angle, THEN
+        descend to `target` — and runs it through the existing
+        TRAJ_BEGIN/TRAJ_POINT/TRAJ_END + RUN protocol (same as any gait
+        trajectory or the initial (0,0,0)-> position move), so it gets
+        TRAJ_PROGRESS live visualization for free instead of only
+        visualizing the subsequent gait run. This call still BLOCKS
+        until the move physically completes (same external contract as
+        before) — see _run_trajectory_blocking().
 
-        Only allowed while IDLE (same rule as go_to_position()) — call
-        after home()/abort()/a FINISHED callback, not while paused.
+        Requires `last_calibration_space` to be available (set by the
+        one HOME performed this session) to compute the lift height's
+        upper bound; this is always true whenever `can_go_to_position()`
+        can be True (HOME must have succeeded first, since IDLE is
+        otherwise unreachable).
+
+        Only allowed while IDLE (see can_go_to_position()) — call after
+        home()/abort()/a FINISHED callback, not while paused.
 
         Raises:
             InvalidTransitionError: If not currently idle.
-            Any exception ESP32Controller.go_to_position()/get_position()
-                may raise, for steps 2-5.
+            RuntimeError: If no CalibrationSpace is available (e.g. an
+                older firmware whose HOME didn't report a full 3-axis
+                limit-mapping sweep — see _build_calibration_space) —
+                the lift height's upper bound cannot be computed
+                without it.
+            Any exception send_trajectory()/run() may raise.
         """
         if not self.can_go_to_position():
             raise InvalidTransitionError(
                 f"Cannot reposition while in state {self._state.name}."
             )
+        if self.last_calibration_space is None:
+            raise RuntimeError(
+                "No hay datos de calibración disponibles; no se puede "
+                "calcular una trayectoria de retorno segura."
+            )
+
+        # Deferred import: trajectory_generator.py imports CalibrationSpace
+        # from this module at its own top level, so importing it back up
+        # here at module scope would be a circular import. Safe to import
+        # locally at call time since by then both modules are fully loaded.
+        from src.utils import trajectory_generator
 
         current = self._controller.get_position()
-        lift_y = max(current.y, floor_y) + self.Y_LIFT_MARGIN_CM
+        points = trajectory_generator.generate_safe_return_trajectory(
+            current,
+            target,
+            floor_y,
+            self.last_calibration_space,
+            self.Y_LIFT_MARGIN_CM,
+            self.ANGLE_REFERENCE_DEG,
+        )
+        if not points:
+            return
+        self._run_trajectory_blocking(points)
 
+    def _run_trajectory_blocking(self, points: List[TrajectoryPoint]) -> None:
+        """
+        Send and run `points`, blocking until the ESP32 reports FINISHED
+        (or the attempt fails), instead of returning as soon as RUNNING
+        starts like the public run() does. Used internally by
+        safe_return_to_position() so it keeps behaving like a single
+        synchronous call to its callers, same as before this was
+        rewritten to use a real trajectory instead of chained GOTOs.
+
+        The existing `on_trajectory_finished` callback (the UI bridge's
+        hook, e.g. for the post-run "save initial position?" prompt) is
+        deliberately NOT invoked for this internal move — it is not a
+        gait trajectory the operator ran, just an implementation detail
+        of getting into position, and firing it would spuriously
+        trigger UI logic meant for real trajectory completions. It is
+        saved and restored around the wait so the real hook is intact
+        for the gait run that follows. `on_trajectory_progress` is left
+        untouched and keeps firing normally, so CalibrationMapWindow's
+        live position marker shows this repositioning move too.
+
+        Raises:
+            InvalidTransitionError: If not currently idle (send_trajectory
+                and run() each enforce this themselves).
+            RuntimeError: If the trajectory transfer itself fails.
+            Any exception run() may raise.
+        """
+        result = self.send_trajectory(points)
+        if not result.success:
+            raise RuntimeError(
+                f"No se pudo transferir la trayectoria de retorno: {result}"
+            )
+
+        finished = threading.Event()
+        original_on_finished = self.on_trajectory_finished
+        self.on_trajectory_finished = finished.set
         try:
-            self._controller.go_to_position(Position(current.x, lift_y, current.angle))
-        except Exception:
-            current = self._controller.get_position()
-            lift_y = current.y
-
-        self._controller.go_to_position(
-            Position(current.x, lift_y, self.ANGLE_REFERENCE_DEG)
-        )
-        self._controller.go_to_position(
-            Position(target.x, lift_y, self.ANGLE_REFERENCE_DEG)
-        )
-        self._controller.go_to_position(Position(target.x, lift_y, target.angle))
-        self._controller.go_to_position(Position(target.x, target.y, target.angle))
+            self.run()
+            finished.wait()
+        finally:
+            self.on_trajectory_finished = original_on_finished
 
     # ------------------------------------------------------------------
     # Internal: reactions to asynchronous ESP32Controller events

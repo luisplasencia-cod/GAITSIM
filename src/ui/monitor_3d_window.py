@@ -41,14 +41,17 @@ was also added — the entire point of this window is watching
 safe_return_to_position()'s multi-step sequence happen, which a single
 static snapshot doesn't convey.
 
-Why polling instead of a signal: safe_return_to_position() is a
-sequence of several blocking GOTO calls with no progress signal of its
-own (unlike trajectory execution, which has TRAJ_PROGRESS) — polling
-GET_POSITION (a read-only query, allowed in any state per
-docs/protocol.md) is the only way to see it move step by step without
-threading a new signal through every position-changing call in
-system_state.py/esp32_controller.py. Only runs while this window is
-visible.
+Why polling instead of relying solely on the signal: as of the safe-
+return-trajectory rework, safe_return_to_position() DOES emit
+TRAJ_PROGRESS/trajectory_progress internally now (it runs its 5-step
+move through the same TRAJ_BEGIN/TRAJ_POINT/TRAJ_END + RUN protocol as
+any gait trajectory, same as CalibrationMapWindow's live marker relies
+on) — so a signal-only implementation is now possible in principle.
+This window still polls GET_POSITION independently, since that was
+already built/verified before the rework and gives an interval/trail
+decoupled from whatever trajectory happens to be running (e.g. also
+shows manual moves and plain GOTOs, which never emit TRAJ_PROGRESS).
+Only runs while this window is visible.
 """
 
 from collections import deque
