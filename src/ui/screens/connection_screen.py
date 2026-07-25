@@ -14,6 +14,7 @@ offer to save it — see src/controllers/initial_position_session.py.
 """
 
 from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QFont, QFontMetrics
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QLineEdit, QGroupBox, QComboBox, QButtonGroup,
@@ -25,9 +26,12 @@ from src.controllers.initial_position_session import InitialPositionSession
 from src.ui.bridge import StateMachineBridge
 from src.ui.style import (
     BUTTON_STYLE, BUTTON_STYLE_PRIMARY, BUTTON_STYLE_COMPACT,
-    LAYOUT_SPACING, LAYOUT_MARGIN, FONT_SIZE_STATUS, FONT_SIZE_NORMAL
+    LAYOUT_SPACING, LAYOUT_MARGIN, FONT_SIZE_STATUS,
+    INPUT_STYLE, COLOR_ACCENT, COLOR_ACCENT_TEXT,
 )
+from src.ui.limit_violation_dialog import LimitViolationDialog
 from src.utils import position_library, trajectory_generator
+from src.utils.trajectory_validator import PositionOutOfRangeError, check_position
 
 # Fixed manual-movement increments (cm for X/Y, degrees for A — the
 # same magnitudes read naturally in both units). Replaces a free-text
@@ -41,6 +45,71 @@ MOVE_INCREMENTS = (1.0, 5.0, 10.0)
 # calibration_map_window.py) — this screen only shows live text status
 # while HOMING is in progress.
 _AXIS_LABELS_ES = {"Y": "Y (vertical)", "X": "X (horizontal)", "A": "ángulo"}
+
+
+class _AutoFitLabel(QLabel):
+    """
+    A QLabel that keeps its FULL text visible — word-wrapped, and with
+    its own font size shrunk (within a reasonable floor) as needed —
+    instead of eliding with "..." (the previous approach here). Luis
+    asked for every message to stay fully readable rather than
+    truncated, while the parent QGroupBox (ESTADO DEL SISTEMA) must
+    still never grow past its fixed size — so this only ever adapts
+    ITSELF (wrap + font size) to whatever fixed space it's given,
+    never the other way around. Scoped to that one box — it was the
+    only widget in the app that actually overflowed with longer
+    messages.
+    """
+
+    _MAX_FONT_PX = FONT_SIZE_STATUS
+    _MIN_FONT_PX = 11  # below this, text becomes hard to read on the
+                        # touchscreen — the floor past which we accept
+                        # the (rare, very long) message just clipping
+                        # rather than shrinking further.
+
+    def __init__(self, text: str = "", parent=None):
+        self._full_text = ""
+        super().__init__(parent)
+        self.setWordWrap(True)
+        self._apply_font_size(self._MAX_FONT_PX)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:
+        self._full_text = text
+        self.setToolTip(text)
+        super().setText(text)
+        self._refit()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Re-fit against the new width/height — setText() alone can't
+        # react to a later resize (width()/height() are still 0 the
+        # first time setText() runs, before the layout has settled).
+        self._refit()
+
+    def _apply_font_size(self, size_px: int) -> None:
+        self.setStyleSheet(f"font-size: {size_px}px; font-weight: bold;")
+
+    def _refit(self) -> None:
+        if not self._full_text or self.width() <= 0 or self.height() <= 0:
+            return
+        # Measure with an independent QFont (not self.font()), since
+        # the widget's own font may not yet reflect the stylesheet set
+        # by a previous _apply_font_size() call at this point.
+        base_font = QFont(self.font())
+        for size in range(self._MAX_FONT_PX, self._MIN_FONT_PX - 1, -1):
+            base_font.setPixelSize(size)
+            metrics = QFontMetrics(base_font)
+            bounds = metrics.boundingRect(
+                0, 0, self.width(), 100_000, Qt.TextWordWrap, self._full_text
+            )
+            if bounds.height() <= self.height():
+                self._apply_font_size(size)
+                return
+        # Even the floor size doesn't fit: use it anyway (best effort —
+        # QLabel clips to its own rect rather than overflowing into
+        # neighboring widgets, so the box's fixed size is still safe).
+        self._apply_font_size(self._MIN_FONT_PX)
 
 
 class _ActionWorker(QThread):
@@ -129,10 +198,11 @@ class ConnectionScreen(QWidget):
         status_box = QGroupBox("ESTADO DEL SISTEMA")
         status_layout = QHBoxLayout(status_box)
 
-        self.status_label = QLabel("DISCONNECTED")
-        self.status_label.setStyleSheet(
-            f"font-size: {FONT_SIZE_STATUS}px; font-weight: bold;"
-        )
+        # Font size/style is managed internally by _AutoFitLabel itself
+        # (shrinks as needed to keep the full message visible) — no
+        # external setStyleSheet() here, that would just be overwritten
+        # on the next setText()/resizeEvent() anyway.
+        self.status_label = _AutoFitLabel("DISCONNECTED")
         status_layout.addWidget(self.status_label)
 
         # --- Connection / Home box ---
@@ -147,6 +217,13 @@ class ConnectionScreen(QWidget):
         conn_layout.addWidget(self.connect_button)
         conn_layout.addWidget(self.home_button)
 
+        # Fixed height, matched to conn_box's own natural size, so a
+        # long status message can never make this box (or the row it
+        # shares with conn_box) grow — _AutoFitLabel keeps the text
+        # itself (wrapped, shrunk if needed) contained within whatever
+        # space that leaves it.
+        status_box.setFixedHeight(conn_box.sizeHint().height())
+
         top_row = QHBoxLayout()
         top_row.setSpacing(LAYOUT_SPACING)
         top_row.addWidget(status_box, 2)
@@ -160,9 +237,7 @@ class ConnectionScreen(QWidget):
 
         # Row 0: load a previously saved position into the fields below.
         self.saved_positions_combo = QComboBox()
-        self.saved_positions_combo.setStyleSheet(
-            f"font-size: {FONT_SIZE_NORMAL}px; min-height: 44px;"
-        )
+        self.saved_positions_combo.setStyleSheet(INPUT_STYLE)
         self.refresh_positions_button = QPushButton("Actualizar")
         self.refresh_positions_button.setStyleSheet(BUTTON_STYLE_COMPACT)
         self.load_position_button = QPushButton("Cargar")
@@ -179,7 +254,7 @@ class ConnectionScreen(QWidget):
         self.pos_y_input = QLineEdit("0")
         self.pos_angle_input = QLineEdit("0")
         for edit in (self.pos_x_input, self.pos_y_input, self.pos_angle_input):
-            edit.setStyleSheet(f"font-size: {FONT_SIZE_NORMAL}px; min-height: 44px;")
+            edit.setStyleSheet(INPUT_STYLE)
 
         position_layout.addWidget(QLabel("X (cm):"), 1, 0)
         position_layout.addWidget(self.pos_x_input, 1, 1)
@@ -251,12 +326,12 @@ class ConnectionScreen(QWidget):
     def _increment_button_style() -> str:
         """Same compact footprint as BUTTON_STYLE_COMPACT, plus a
         visibly highlighted checked state (radio-button behavior)."""
-        return BUTTON_STYLE_COMPACT + """
-            QPushButton:checked {
-                background-color: #3987e5;
-                color: white;
+        return BUTTON_STYLE_COMPACT + f"""
+            QPushButton:checked {{
+                background-color: {COLOR_ACCENT};
+                color: {COLOR_ACCENT_TEXT};
                 font-weight: bold;
-            }
+            }}
         """
 
     def _connect_signals(self):
@@ -406,9 +481,31 @@ class ConnectionScreen(QWidget):
         # trajectory (see _on_goto_initial_synchronized).
         previous = self._position_session.position
         if previous is not None:
-            action_fn = lambda: self._bridge.state_machine.safe_return_to_position(
-                position, previous.y
-            )
+            # Pre-check `position` itself (the return trajectory's only
+            # validated target — see generate_safe_return_trajectory)
+            # so an out-of-range value shows the visual dialog instead
+            # of running the background worker just to hit the same
+            # rejection as a plain string.
+            space = self._bridge.state_machine.last_calibration_space
+            if space is not None:
+                violations = check_position(position, space)
+                if violations:
+                    LimitViolationDialog(
+                        space, "No se puede establecer esa posición inicial",
+                        position, violations, parent=self,
+                    ).exec()
+                    return
+
+            def action_fn():
+                try:
+                    self._bridge.state_machine.safe_return_to_position(
+                        position, previous.y
+                    )
+                except PositionOutOfRangeError as exc:
+                    raise RuntimeError(
+                        f"No se puede establecer esa posición inicial: {exc}"
+                    ) from exc
+
             self._run_action(
                 action_fn,
                 success_message=f"En posición inicial: X={x:g} cm, Y={y:g} cm, Á={angle:g}°.",
@@ -443,7 +540,10 @@ class ConnectionScreen(QWidget):
                 position, space
             )
         except trajectory_generator.PositionOutOfRangeError as exc:
-            self.status_label.setText(str(exc))
+            LimitViolationDialog.from_position_error(
+                space, "No se puede establecer esa posición inicial",
+                position, exc, parent=self,
+            ).exec()
             return
 
         if not points:
@@ -490,12 +590,47 @@ class ConnectionScreen(QWidget):
 
     def _on_manual_move(self, axis: str, direction: str):
         amount = self._move_increment
+
+        # Pre-check on the UI thread against the LOCALLY tracked
+        # position (same rationale/precedent as the X/angle-reference
+        # check in _refresh_controls below: a live GET_POSITION round
+        # trip here would freeze the UI) so an out-of-range increment
+        # can show the visual LimitViolationDialog with the actual
+        # target instead of a plain status string — move_relative()
+        # still re-validates for real via the background worker below,
+        # this is purely a presentation-layer preview of the same check.
+        sm = self._bridge.state_machine
+        current = self._position_session.position
+        space = sm.last_calibration_space
+        if current is not None and space is not None:
+            delta = amount if direction == "+" else -amount
+            target = Position(
+                x=current.x + delta if axis == "X" else current.x,
+                y=current.y + delta if axis == "Y" else current.y,
+                angle=current.angle + delta if axis == "A" else current.angle,
+            )
+            violations = check_position(target, space)
+            if violations:
+                LimitViolationDialog(
+                    space, "No se puede aplicar ese incremento manual",
+                    target, violations, parent=self,
+                ).exec()
+                return
+
+        def move():
+            try:
+                self._bridge.state_machine.move_relative(axis, direction, amount)
+            except PositionOutOfRangeError as exc:
+                raise RuntimeError(
+                    f"No se puede aplicar ese incremento manual: {exc}"
+                ) from exc
+
         # No success_message here: the operator should see the resulting
         # X/Y/Angle values change directly in the Posición Inicial fields
         # (via _on_manual_move_succeeded below), not a "+5"/"-5" delta
         # message in Estado del Sistema.
         self._run_action(
-            lambda: self._bridge.state_machine.move_relative(axis, direction, amount),
+            move,
             success_message=None,
             on_success=lambda: self._on_manual_move_succeeded(axis, direction, amount),
         )

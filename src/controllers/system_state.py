@@ -257,10 +257,16 @@ class SystemStateMachine:
 
     # Tolerance (degrees) for comparing an angle against
     # ANGLE_REFERENCE_DEG — floats, never compared with bare equality.
+    # Widened from 1e-3 (effectively "exact match only") to +/-2.0 per
+    # Luis's explicit request: the X buttons were only ever enabling at
+    # angle == 0 dead-on, which was impractical in practice (small
+    # accumulated float drift from repeated moves, or a slightly-off
+    # rotation) — a +/-2 deg window around the reference is still safe
+    # enough mechanically to allow X travel.
     # Public: connection_screen.py's _refresh_controls compares its own
     # locally-tracked position against this same constant to decide
     # whether to enable the manual X buttons (see move_relative below).
-    ANGLE_REFERENCE_TOLERANCE_DEG = 1e-3
+    ANGLE_REFERENCE_TOLERANCE_DEG = 2.0
 
     def move_relative(self, axis: str, direction: str, amount: float) -> None:
         """

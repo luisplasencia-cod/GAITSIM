@@ -10,7 +10,7 @@ needs no new plumbing in SystemStateMachine or below.
 from PySide6.QtWidgets import QLabel
 
 from src.ui.bridge import StateMachineBridge
-from src.ui.style import STATUS_COLORS, STATUS_INDICATOR_DIAMETER
+from src.ui.style import COLOR_INDICATOR_RING, STATUS_COLORS, STATUS_INDICATOR_DIAMETER
 
 
 class StatusIndicator(QLabel):
@@ -55,5 +55,5 @@ class StatusIndicator(QLabel):
         self.setStyleSheet(
             f"background-color: {color}; "
             f"border-radius: {radius}px; "
-            f"border: 2px solid #00000040;"
+            f"border: 2px solid {COLOR_INDICATOR_RING};"
         )

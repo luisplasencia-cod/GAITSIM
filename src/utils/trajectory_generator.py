@@ -36,6 +36,7 @@ from typing import List
 
 from src.communication.protocol import Position, TrajectoryPoint
 from src.controllers.system_state import CalibrationSpace
+from src.utils.trajectory_validator import PositionOutOfRangeError, validate_position
 
 # Assumed max speed per axis (cm/s for X/Y, deg/s for angle), used only
 # to compute how long each axis WOULD take on its own so the slowest
@@ -57,35 +58,6 @@ WAYPOINT_INTERVAL_S = 0.1
 # treated as a no-op rather than generating a degenerate near-zero-
 # duration trajectory.
 _MIN_MOVE_DISTANCE = 1e-6
-
-
-class TrajectoryGenerationError(Exception):
-    """Base exception for all trajectory_generator failures."""
-    pass
-
-
-class PositionOutOfRangeError(TrajectoryGenerationError):
-    """The requested target position falls outside the available
-    movement space computed by the most recent HOME (see
-    SystemStateMachine.CalibrationSpace)."""
-    pass
-
-
-def _validate_within_space(target: Position, space: CalibrationSpace) -> None:
-    problems = []
-    if not (space.x_min <= target.x <= space.x_max):
-        problems.append(f"X={target.x:g} fuera de [{space.x_min:g}, {space.x_max:g}]")
-    if not (space.y_min <= target.y <= space.y_max):
-        problems.append(f"Y={target.y:g} fuera de [{space.y_min:g}, {space.y_max:g}]")
-    if not (space.angle_min <= target.angle <= space.angle_max):
-        problems.append(
-            f"Ángulo={target.angle:g} fuera de "
-            f"[{space.angle_min:g}, {space.angle_max:g}]"
-        )
-    if problems:
-        raise PositionOutOfRangeError(
-            "Posición fuera del espacio calibrado: " + "; ".join(problems)
-        )
 
 
 def _interpolate(start: Position, target: Position) -> List[TrajectoryPoint]:
@@ -161,7 +133,7 @@ def generate_synchronized_trajectory(
         target.angle), sampled every WAYPOINT_INTERVAL_S. Empty list if
         target is indistinguishable from start (nothing to move).
     """
-    _validate_within_space(target, calibration_space)
+    validate_position(target, calibration_space)
     return _interpolate(start, target)
 
 
@@ -261,7 +233,7 @@ def generate_safe_return_trajectory(
         special-cased that either. Empty list only in the fully
         degenerate case where every step is simultaneously a no-op.
     """
-    _validate_within_space(target, calibration_space)
+    validate_position(target, calibration_space)
 
     lift_y = min(
         max(current.y, floor_y) + lift_margin_cm, calibration_space.y_max

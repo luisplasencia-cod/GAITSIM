@@ -5,10 +5,13 @@ Non-modal window that visualizes the available movement-space map
 computed by a HOME's 3-axis limit-mapping sweep (see docs/protocol.md,
 Calibration Events, and SystemStateMachine.CalibrationSpace in
 system_state.py). Originally embedded as a panel inside
-ConnectionScreen; moved out into its own window (same pattern as
-Monitor Posición / monitor_3d_window.py) so the diagram has real room
-to read instead of competing for space with the connection/manual-
-movement controls.
+ConnectionScreen; moved out into its own window so the diagram has real
+room to read instead of competing for space with the connection/
+manual-movement controls. Still its own standalone window as of the
+2026-07-25 consolidation that folded "Monitor Posición" (see
+src/ui/platform_view.py) directly into trajectory_screen.py instead —
+that window's own calibration-bounds overlay is a separate, additive
+drawing on its own canvas, not a replacement for this one.
 
 Read-only: never sends commands, only reacts to StateMachineBridge
 signals (calibration_limit/calibration_progress while HOMING) and
@@ -29,7 +32,7 @@ from src.controllers.system_state import CalibrationSpace
 from src.ui.bridge import StateMachineBridge
 from src.ui.style import (
     COLOR_SURFACE_ALT, COLOR_TEXT_MUTED, COLOR_AXIS_X, COLOR_AXIS_Y,
-    COLOR_AXIS_ANGLE, COLOR_ACCENT, FONT_SIZE_NORMAL,
+    COLOR_AXIS_ANGLE, COLOR_ACCENT, FONT_SIZE_NORMAL, STATUS_COLORS,
 )
 
 # Spanish labels for calibration status messages, keyed by the axis
@@ -42,8 +45,8 @@ class CalibrationMapView(QWidget):
     Draws the available movement-space footprint from a completed
     calibration: the X x Y rectangle the platform can reach, plus the
     angular sweep. Uses the same per-axis colors as the live trajectory
-    plot (trajectory_screen.py) and Monitor Posición
-    (monitor_3d_window.py) so one color always means the same axis
+    plot and the position monitor (both now in trajectory_screen.py —
+    see src/ui/platform_view.py) so one color always means the same axis
     everywhere in the app.
     """
 
@@ -56,6 +59,12 @@ class CalibrationMapView(QWidget):
         # synchronized (0,0,0) -> initial-position move — is executing.
         # None until the first progress event arrives.
         self._current_position: Position | None = None
+        # Out-of-range position/boundary highlight, set by
+        # limit_violation_dialog.py — entirely independent of
+        # _current_position above so a rejection dialog can never be
+        # confused with an actual in-progress trajectory.
+        self._violation_position: Position | None = None
+        self._violation_boundaries: set = set()
 
     def set_calibration_space(self, space: CalibrationSpace | None) -> None:
         self._space = space
@@ -63,6 +72,20 @@ class CalibrationMapView(QWidget):
 
     def set_current_position(self, position: Position | None) -> None:
         self._current_position = position
+        self.update()
+
+    def set_violation(
+        self, position: Position | None, exceeded_boundaries: set
+    ) -> None:
+        """
+        Highlights an out-of-range position: draws its marker clamped to
+        the footprint edge in a warning color, plus the specific
+        boundary edge(s) it exceeds (`exceeded_boundaries`, any of
+        "x_min"/"x_max"/"y_min"/"y_max"/"angle_min"/"angle_max"). Used
+        by limit_violation_dialog.LimitViolationDialog.
+        """
+        self._violation_position = position
+        self._violation_boundaries = exceeded_boundaries
         self.update()
 
     def paintEvent(self, event):
@@ -144,7 +167,9 @@ class CalibrationMapView(QWidget):
         # sweeps clockwise from there.
         start_qt = int((90 - space.angle_min) * 16)
         span_qt = -int(space.angle_range * 16)
-        painter.setPen(QPen(QColor(COLOR_AXIS_ANGLE), 2))
+        angle_violated = bool(self._violation_boundaries & {"angle_min", "angle_max"})
+        arc_color = STATUS_COLORS["ERROR"] if angle_violated else COLOR_AXIS_ANGLE
+        painter.setPen(QPen(QColor(arc_color), 3 if angle_violated else 2))
         painter.setBrush(Qt.NoBrush)
         painter.drawArc(arc_rect, start_qt, span_qt)
         painter.drawText(
@@ -176,6 +201,56 @@ class CalibrationMapView(QWidget):
             painter.drawLine(marker, tip)
             painter.setBrush(QBrush(QColor(COLOR_ACCENT)))
             painter.drawEllipse(marker, 7, 7)
+
+        # Violation highlight: the specific footprint edge(s) exceeded
+        # (angle is handled above, as part of the arc itself), plus a
+        # marker for the offending position — clamped to the footprint
+        # since the real value is, by definition, outside it. A short
+        # dashed line points from the clamped edge toward where the
+        # real (out-of-range) value actually falls, so "goes past here"
+        # reads visually even though it can't be drawn at its true,
+        # off-map location.
+        warn_color = QColor(STATUS_COLORS["ERROR"])
+        edge_pen = QPen(warn_color, 4)
+        if "x_max" in self._violation_boundaries:
+            painter.setPen(edge_pen)
+            painter.drawLine(QPointF(rect_x + rect_w, rect_y), QPointF(rect_x + rect_w, rect_y + rect_h))
+        if "x_min" in self._violation_boundaries:
+            painter.setPen(edge_pen)
+            painter.drawLine(QPointF(rect_x, rect_y), QPointF(rect_x, rect_y + rect_h))
+        if "y_max" in self._violation_boundaries:
+            painter.setPen(edge_pen)
+            painter.drawLine(QPointF(rect_x, rect_y), QPointF(rect_x + rect_w, rect_y))
+        if "y_min" in self._violation_boundaries:
+            painter.setPen(edge_pen)
+            painter.drawLine(QPointF(rect_x, rect_y + rect_h), QPointF(rect_x + rect_w, rect_y + rect_h))
+
+        if self._violation_position is not None:
+            pos = self._violation_position
+            x_frac = 0.0 if x_range <= 0 else (pos.x - space.x_min) / x_range
+            y_frac = 0.0 if y_range <= 0 else (pos.y - space.y_min) / y_range
+            clamped_x_frac = min(max(x_frac, 0.0), 1.0)
+            clamped_y_frac = min(max(y_frac, 0.0), 1.0)
+            clamped = QPointF(
+                rect_x + clamped_x_frac * rect_w,
+                rect_y + rect_h - clamped_y_frac * rect_h,
+            )
+            true_point = QPointF(
+                rect_x + x_frac * rect_w, rect_y + rect_h - y_frac * rect_h
+            )
+            dx = true_point.x() - clamped.x()
+            dy = true_point.y() - clamped.y()
+            length = math.hypot(dx, dy)
+            if length > 0:
+                overshoot = QPointF(
+                    clamped.x() + dx / length * 18, clamped.y() + dy / length * 18
+                )
+                painter.setPen(QPen(warn_color, 3, Qt.DashLine))
+                painter.drawLine(clamped, overshoot)
+
+            painter.setPen(QPen(warn_color, 2))
+            painter.setBrush(QBrush(warn_color))
+            painter.drawEllipse(clamped, 9, 9)
 
         painter.end()
 
