@@ -30,6 +30,7 @@ from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 from src.communication.protocol import Position
 from src.controllers.system_state import CalibrationSpace
 from src.ui.bridge import StateMachineBridge
+from src.ui.theme_manager import ThemeManager
 from src.ui.style import (
     COLOR_SURFACE_ALT, COLOR_TEXT_MUTED, COLOR_AXIS_X, COLOR_AXIS_Y,
     COLOR_AXIS_ANGLE, COLOR_ACCENT, FONT_SIZE_NORMAL, STATUS_COLORS,
@@ -91,10 +92,10 @@ class CalibrationMapView(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.fillRect(self.rect(), QColor(COLOR_SURFACE_ALT))
+        painter.fillRect(self.rect(), QColor(COLOR_SURFACE_ALT()))
 
         if self._space is None:
-            painter.setPen(QColor(COLOR_TEXT_MUTED))
+            painter.setPen(QColor(COLOR_TEXT_MUTED()))
             painter.drawText(self.rect(), Qt.AlignCenter, "Sin calibrar")
             painter.end()
             return
@@ -115,14 +116,14 @@ class CalibrationMapView(QWidget):
         rect_y = margin + (avail_h - rect_h) / 2
         footprint = QRectF(rect_x, rect_y, rect_w, rect_h)
 
-        fill = QColor(COLOR_AXIS_X)
+        fill = QColor(COLOR_AXIS_X())
         fill.setAlpha(35)
         painter.setBrush(QBrush(fill))
-        painter.setPen(QPen(QColor(COLOR_AXIS_X), 2))
+        painter.setPen(QPen(QColor(COLOR_AXIS_X()), 2))
         painter.drawRect(footprint)
 
         # Y ruler: vertical extent, left of the footprint.
-        painter.setPen(QPen(QColor(COLOR_AXIS_Y), 2))
+        painter.setPen(QPen(QColor(COLOR_AXIS_Y()), 2))
         painter.drawLine(
             QPointF(rect_x - 14, rect_y), QPointF(rect_x - 14, rect_y + rect_h)
         )
@@ -136,7 +137,7 @@ class CalibrationMapView(QWidget):
         )
 
         # X ruler: horizontal extent, below the footprint.
-        painter.setPen(QPen(QColor(COLOR_AXIS_X), 2))
+        painter.setPen(QPen(QColor(COLOR_AXIS_X()), 2))
         painter.drawText(
             QRectF(rect_x, rect_y + rect_h + 8, rect_w, 24), Qt.AlignLeft, "0",
         )
@@ -157,7 +158,7 @@ class CalibrationMapView(QWidget):
             arc_radius * 2, arc_radius * 2,
         )
 
-        ref_pen = QPen(QColor(COLOR_TEXT_MUTED), 1, Qt.DashLine)
+        ref_pen = QPen(QColor(COLOR_TEXT_MUTED()), 1, Qt.DashLine)
         painter.setPen(ref_pen)
         painter.drawLine(center, QPointF(center.x(), center.y() - arc_radius))
 
@@ -168,7 +169,7 @@ class CalibrationMapView(QWidget):
         start_qt = int((90 - space.angle_min) * 16)
         span_qt = -int(space.angle_range * 16)
         angle_violated = bool(self._violation_boundaries & {"angle_min", "angle_max"})
-        arc_color = STATUS_COLORS["ERROR"] if angle_violated else COLOR_AXIS_ANGLE
+        arc_color = STATUS_COLORS()["ERROR"] if angle_violated else COLOR_AXIS_ANGLE()
         painter.setPen(QPen(QColor(arc_color), 3 if angle_violated else 2))
         painter.setBrush(Qt.NoBrush)
         painter.drawArc(arc_rect, start_qt, span_qt)
@@ -197,9 +198,9 @@ class CalibrationMapView(QWidget):
                 marker.x() + direction.x() * 22, marker.y() + direction.y() * 22
             )
 
-            painter.setPen(QPen(QColor(COLOR_ACCENT), 2))
+            painter.setPen(QPen(QColor(COLOR_ACCENT()), 2))
             painter.drawLine(marker, tip)
-            painter.setBrush(QBrush(QColor(COLOR_ACCENT)))
+            painter.setBrush(QBrush(QColor(COLOR_ACCENT())))
             painter.drawEllipse(marker, 7, 7)
 
         # Violation highlight: the specific footprint edge(s) exceeded
@@ -210,7 +211,7 @@ class CalibrationMapView(QWidget):
         # real (out-of-range) value actually falls, so "goes past here"
         # reads visually even though it can't be drawn at its true,
         # off-map location.
-        warn_color = QColor(STATUS_COLORS["ERROR"])
+        warn_color = QColor(STATUS_COLORS()["ERROR"])
         edge_pen = QPen(warn_color, 4)
         if "x_max" in self._violation_boundaries:
             painter.setPen(edge_pen)
@@ -260,15 +261,22 @@ class CalibrationMapWindow(QWidget):
     Args:
         bridge: The shared StateMachineBridge — read-only use here,
                 same instance every other screen/window shares.
+        theme_manager: shared ThemeManager — this window is created
+                lazily and cached (see main_window.py's
+                _open_calibration_map), so if it's still open when the
+                operator toggles light/dark, its own labels (baked
+                colors, unlike CalibrationMapView's canvas which redraws
+                fresh) need to be told to re-apply.
     """
 
-    def __init__(self, bridge: StateMachineBridge, parent=None):
+    def __init__(self, bridge: StateMachineBridge, theme_manager: ThemeManager, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Espacio Disponible — GAITSIM")
         self.resize(700, 700)
         self._bridge = bridge
         self._build_ui()
         self._connect_signals()
+        theme_manager.theme_changed.connect(self._apply_theme)
         # Reflect an already-completed calibration immediately if this
         # window is opened after HOME already succeeded this session,
         # rather than only reacting to newly-arriving events.
@@ -285,26 +293,29 @@ class CalibrationMapWindow(QWidget):
         info_layout.setContentsMargins(16, 10, 16, 10)
 
         self._status_label = QLabel("Sin calibrar")
-        self._status_label.setStyleSheet(
-            f"font-size: {FONT_SIZE_NORMAL}px; color: {COLOR_TEXT_MUTED};"
-        )
         info_layout.addWidget(self._status_label)
         info_layout.addStretch()
 
         self._y_label = QLabel("Y: —")
-        self._y_label.setStyleSheet(f"color: {COLOR_AXIS_Y}; font-weight: 600;")
         self._x_label = QLabel("X: —")
-        self._x_label.setStyleSheet(f"color: {COLOR_AXIS_X}; font-weight: 600;")
         self._angle_label = QLabel("Ángulo: —")
-        self._angle_label.setStyleSheet(f"color: {COLOR_AXIS_ANGLE}; font-weight: 600;")
         for label in (self._y_label, self._x_label, self._angle_label):
             info_layout.addWidget(label)
             info_layout.addSpacing(16)
+        self._apply_theme(None)
 
         root.addWidget(info_bar)
 
         self._map_view = CalibrationMapView()
         root.addWidget(self._map_view, stretch=1)
+
+    def _apply_theme(self, _name) -> None:
+        self._status_label.setStyleSheet(
+            f"font-size: {FONT_SIZE_NORMAL}px; color: {COLOR_TEXT_MUTED()};"
+        )
+        self._y_label.setStyleSheet(f"color: {COLOR_AXIS_Y()}; font-weight: 600;")
+        self._x_label.setStyleSheet(f"color: {COLOR_AXIS_X()}; font-weight: 600;")
+        self._angle_label.setStyleSheet(f"color: {COLOR_AXIS_ANGLE()}; font-weight: 600;")
 
     def _connect_signals(self):
         self._bridge.calibration_limit.connect(self._on_calibration_limit)

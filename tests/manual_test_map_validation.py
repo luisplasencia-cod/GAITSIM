@@ -23,6 +23,7 @@ from src.controllers.initial_position_session import InitialPositionSession
 from src.controllers.system_state import CalibrationSpace, SystemState, SystemStateMachine
 from src.ui.bridge import StateMachineBridge
 from src.ui.screens.trajectory_screen import TrajectoryScreen
+from src.ui.theme_manager import ThemeManager
 from src.utils import trajectory_generator
 from src.utils.trajectory_validator import PositionOutOfRangeError
 
@@ -117,7 +118,7 @@ def test_return_trajectory_out_of_range():
 def make_trajectory_screen(sm: SystemStateMachine) -> TrajectoryScreen:
     bridge = StateMachineBridge(sm)
     session = InitialPositionSession(position=Position(x=0.0, y=0.0, angle=0.0))
-    return TrajectoryScreen(bridge, session)
+    return TrajectoryScreen(bridge, session, ThemeManager())
 
 
 def test_ensayo_out_of_range():

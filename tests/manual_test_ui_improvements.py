@@ -26,6 +26,7 @@ from src.controllers.system_state import CalibrationSpace, SystemState, SystemSt
 from src.ui.bridge import StateMachineBridge
 from src.ui.limit_violation_dialog import LimitViolationDialog
 from src.ui.screens.connection_screen import ConnectionScreen
+from src.ui.theme_manager import ThemeManager
 from src.utils.trajectory_validator import check_position
 
 SPACE = CalibrationSpace(
@@ -97,7 +98,7 @@ def make_connection_screen():
     sm = SystemStateMachine(controller)
     sm._state = SystemState.IDLE
     bridge = StateMachineBridge(sm)
-    return ConnectionScreen(bridge, InitialPositionSession())
+    return ConnectionScreen(bridge, InitialPositionSession(), ThemeManager())
 
 
 def test_status_box_fixed_height():

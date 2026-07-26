@@ -21,7 +21,7 @@ classes reused here as-is.
 import time
 
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QGroupBox, QInputDialog, QMessageBox
@@ -29,9 +29,12 @@ from PySide6.QtWidgets import (
 
 from src.communication.protocol import TrajectoryPoint
 from src.controllers.initial_position_session import InitialPositionSession
+from src.ui.action_worker import ActionWorker as _ActionWorker
 from src.ui.bridge import StateMachineBridge
 from src.ui.limit_violation_dialog import LimitViolationDialog
+from src.ui.manual_joystick import ManualJoystickControl
 from src.ui.platform_view import PlatformView, PositionPoller
+from src.ui.theme_manager import ThemeManager
 from src.ui.style import (
     BUTTON_STYLE_SLIM, BUTTON_STYLE_PRIMARY_SLIM,
     LAYOUT_SPACING, LAYOUT_MARGIN, FONT_SIZE_NORMAL,
@@ -41,28 +44,6 @@ from src.ui.style import (
 from src.utils import position_library
 from src.utils.trajectory_library import list_trajectories, load_trajectory_by_id
 from src.utils.trajectory_validator import TrajectoryOutOfRangeError, validate_trajectory
-
-
-class _ActionWorker(QThread):
-    """
-    Same minimal single-shot background worker pattern used in
-    ConnectionScreen, duplicated here rather than shared for now since
-    it is a small, self-contained class — if a third screen needs it,
-    this is the signal to promote it to a shared module under src/ui/.
-    """
-    succeeded = Signal()
-    failed = Signal(str)
-
-    def __init__(self, action_fn, parent=None):
-        super().__init__(parent)
-        self._action_fn = action_fn
-
-    def run(self):
-        try:
-            self._action_fn()
-            self.succeeded.emit()
-        except Exception as exc:
-            self.failed.emit(str(exc))
 
 
 class TrajectoryScreen(QWidget):
@@ -88,11 +69,13 @@ class TrajectoryScreen(QWidget):
         self,
         bridge: StateMachineBridge,
         position_session: InitialPositionSession,
+        theme_manager: ThemeManager,
         parent=None,
     ):
         super().__init__(parent)
         self._bridge = bridge
         self._position_session = position_session
+        self._theme_manager = theme_manager
         self._worker = None
         # PlatformView's polling companion (see platform_view.py) —
         # created lazily on showEvent, stopped on hideEvent, exactly
@@ -144,6 +127,11 @@ class TrajectoryScreen(QWidget):
         self._plot_active = False
 
         self._build_ui()
+        # Wired here rather than passed at construction (see
+        # _build_platform_panel): self.info_label doesn't exist yet at
+        # the point the joystick itself is built.
+        self._joystick.set_status_callback(self.info_label.setText)
+        self._theme_manager.theme_changed.connect(self._apply_theme)
         self._connect_signals()
         self._refresh_trajectory_list()
         self._refresh_controls()
@@ -226,7 +214,7 @@ class TrajectoryScreen(QWidget):
 
         exec_layout = QHBoxLayout()
         self.run_button = QPushButton("Run")
-        self.run_button.setStyleSheet(BUTTON_STYLE_PRIMARY_SLIM)
+        self.run_button.setStyleSheet(BUTTON_STYLE_PRIMARY_SLIM())
         self.pause_button = QPushButton("Pause")
         self.pause_button.setStyleSheet(BUTTON_STYLE_SLIM)
         self.resume_button = QPushButton("Resume")
@@ -300,7 +288,7 @@ class TrajectoryScreen(QWidget):
 
         self._calibration_label = QLabel("Referencia HOME: X=0, Y=0 (punto blanco)")
         self._calibration_label.setStyleSheet(
-            f"font-size: {FONT_SIZE_NORMAL}px; color: {COLOR_TEXT_MUTED};"
+            f"font-size: {FONT_SIZE_NORMAL}px; color: {COLOR_TEXT_MUTED()};"
         )
         info_layout.addWidget(self._calibration_label)
         panel.addWidget(info_bar)
@@ -308,17 +296,31 @@ class TrajectoryScreen(QWidget):
         self._platform_view = PlatformView()
         panel.addWidget(self._platform_view, stretch=1)
 
+        # Manual movement joystick (2026-07-25+ redesign, moved from
+        # ConnectionScreen's old "Movimiento Manual" box) — floats in
+        # the top-right corner of the visualization itself (parent=
+        # self._platform_view, not the outer panel), see
+        # src/ui/manual_joystick.py for why it's a plain floating child
+        # rather than embedded in this layout.
+        self._joystick = ManualJoystickControl(
+            self._bridge, self._position_session, self._platform_view,
+            self._theme_manager,
+        )
+
         content_row.addLayout(panel, stretch=3)
 
     @staticmethod
     def _format_position_text(x: float, y: float, angle: float) -> str:
         # Colored to match the drawing's X/Y/angle encoding (and the
         # live trajectory plot's own palette below) — same axis, same
-        # color, everywhere in the app.
+        # color, everywhere in the app. Called fresh on every position
+        # update (~5x/s while this screen is visible), so it always
+        # reflects whichever theme is currently active with no extra
+        # re-application needed.
         return (
-            f'<span style="color:{COLOR_AXIS_X}">X:</span> {x:.1f} cm &nbsp;&nbsp; '
-            f'<span style="color:{COLOR_AXIS_Y}">Y:</span> {y:.1f} cm &nbsp;&nbsp; '
-            f'<span style="color:{COLOR_AXIS_ANGLE}">Á:</span> {angle:.1f}°'
+            f'<span style="color:{COLOR_AXIS_X()}">X:</span> {x:.1f} cm &nbsp;&nbsp; '
+            f'<span style="color:{COLOR_AXIS_Y()}">Y:</span> {y:.1f} cm &nbsp;&nbsp; '
+            f'<span style="color:{COLOR_AXIS_ANGLE()}">Á:</span> {angle:.1f}°'
         )
 
     def _on_position_received(self, position):
@@ -333,6 +335,11 @@ class TrajectoryScreen(QWidget):
             self._poller = PositionPoller(self._bridge.state_machine, self)
             self._poller.position_received.connect(self._on_position_received)
             self._poller.start()
+        # position_session is plain data (no Qt signal) — a move made on
+        # ConnectionScreen (GOTO, safe return) while this screen was
+        # hidden wouldn't otherwise be reflected in the joystick's
+        # enabled state until the next unrelated state_changed.
+        self._joystick.refresh_controls()
 
     def hideEvent(self, event):
         super().hideEvent(event)
@@ -346,11 +353,13 @@ class TrajectoryScreen(QWidget):
             self._poller = None
         super().closeEvent(event)
 
-    # Shared with platform_view.py (see style.py's COLOR_AXIS_* constants)
-    # so the same axis reads as the same color throughout the app.
-    _COLOR_POS_X = COLOR_AXIS_X
-    _COLOR_POS_Y = COLOR_AXIS_Y
-    _COLOR_ANGLE = COLOR_AXIS_ANGLE
+    # Title text for the 3 stacked plot rows — kept as one place so
+    # _build_plot_box() and _apply_theme() (which re-sets each title's
+    # color on a theme change) share the exact same strings.
+    _PLOT_TITLES = (
+        "Posición X vs Tiempo", "Posición Y vs Tiempo", "Ángulo vs Tiempo",
+    )
+    _PLOT_TITLE_SIZE = "9pt"
 
     # Overrides ONLY the title-reserved space (margin-top/padding-top)
     # that the app-wide QGroupBox rule (style.py's APP_STYLESHEET)
@@ -363,12 +372,15 @@ class TrajectoryScreen(QWidget):
     _NO_TITLE_GROUPBOX_STYLE = "QGroupBox { margin-top: 4px; padding-top: 6px; }"
 
     def _build_plot_box(self, root):
-        # Was a near-but-not-quite "#1a1a19" hardcoded hex — aligning to
-        # the app's actual COLOR_BG/COLOR_TEXT so the plot's real
-        # rendered background matches the surface the axis pen colors
-        # (COLOR_AXIS_X/Y/ANGLE above) were validated against (dataviz
-        # skill), instead of a slightly different stand-in dark.
-        pg.setConfigOptions(background=COLOR_BG, foreground=COLOR_TEXT)
+        # Aligning to the app's actual COLOR_BG()/COLOR_TEXT() so the
+        # plot's real rendered background matches the surface the axis
+        # pen colors (COLOR_AXIS_X/Y/ANGLE) were validated against
+        # (dataviz skill, dark theme only — see style.py's module
+        # docstring on the light palette's contrast being a first pass).
+        # setConfigOptions() only affects plots created AFTER this call;
+        # _apply_theme() below re-colors this SAME plot_widget/curves in
+        # place for a live theme change.
+        pg.setConfigOptions(background=COLOR_BG(), foreground=COLOR_TEXT())
 
         # No fixed setMaximumHeight cap (2026-07-25 layout pass removed
         # it — it was capping this box BELOW what it needed, which is
@@ -389,25 +401,21 @@ class TrajectoryScreen(QWidget):
         # still fit without the bottom one clipping off.
         self._plot_widget.ci.layout.setSpacing(2)
 
-        # Small-panel title size for all 3 — same information, just
-        # sized to fit the sidebar rather than the previous half-window
-        # panel's default (~12pt).
-        _TITLE_SIZE = "9pt"
-
         # No "left" axis label text on any row (each title already says
         # what it plots, e.g. "Posición X vs Tiempo") — pyqtgraph draws
         # that label rotated alongside the row, which ate a lot of
         # width/height for text that's redundant with the title once
         # rows are this short. The Y-axis itself (with its cm/deg tick
         # values) stays, only the extra text label is dropped.
+        x_title, y_title, angle_title = self._PLOT_TITLES
         self._x_plot = self._plot_widget.addPlot(row=0, col=0)
-        self._x_plot.setTitle("Posición X vs Tiempo", size=_TITLE_SIZE)
+        self._x_plot.setTitle(x_title, size=self._PLOT_TITLE_SIZE)
 
         self._y_plot = self._plot_widget.addPlot(row=1, col=0)
-        self._y_plot.setTitle("Posición Y vs Tiempo", size=_TITLE_SIZE)
+        self._y_plot.setTitle(y_title, size=self._PLOT_TITLE_SIZE)
 
         self._angle_plot = self._plot_widget.addPlot(row=2, col=0)
-        self._angle_plot.setTitle("Ángulo vs Tiempo", size=_TITLE_SIZE)
+        self._angle_plot.setTitle(angle_title, size=self._PLOT_TITLE_SIZE)
 
         self._y_plot.setXLink(self._x_plot)
         self._angle_plot.setXLink(self._x_plot)
@@ -421,9 +429,9 @@ class TrajectoryScreen(QWidget):
         self._x_plot.getAxis("bottom").setStyle(showValues=False)
         self._y_plot.getAxis("bottom").setStyle(showValues=False)
 
-        self._x_curve = self._x_plot.plot(pen=pg.mkPen(color=self._COLOR_POS_X, width=2))
-        self._y_curve = self._y_plot.plot(pen=pg.mkPen(color=self._COLOR_POS_Y, width=2))
-        self._angle_curve = self._angle_plot.plot(pen=pg.mkPen(color=self._COLOR_ANGLE, width=2))
+        self._x_curve = self._x_plot.plot(pen=pg.mkPen(color=COLOR_AXIS_X(), width=2))
+        self._y_curve = self._y_plot.plot(pen=pg.mkPen(color=COLOR_AXIS_Y(), width=2))
+        self._angle_curve = self._angle_plot.plot(pen=pg.mkPen(color=COLOR_AXIS_ANGLE(), width=2))
 
         # The graph itself gets all the stretch — the button below it
         # (stretch=0, its own natural/minimal size) must never be able
@@ -442,6 +450,38 @@ class TrajectoryScreen(QWidget):
         plot_layout.addWidget(self.clear_plot_button, stretch=0)
 
         root.addWidget(plot_box, stretch=1)
+
+    def _apply_theme(self, _name: str) -> None:
+        """
+        Re-applies every color this screen bakes into a widget's own
+        stylesheet/pen at construction time (see style.py's module
+        docstring for why that's necessary at all). PlatformView isn't
+        touched here — it reads COLOR_*() fresh inside its own
+        paintEvent already, so it re-colors itself on its own next
+        repaint; calling update() just makes that happen immediately
+        instead of waiting for the position poller's next ~200ms tick.
+        """
+        self.run_button.setStyleSheet(BUTTON_STYLE_PRIMARY_SLIM())
+        self._calibration_label.setStyleSheet(
+            f"font-size: {FONT_SIZE_NORMAL}px; color: {COLOR_TEXT_MUTED()};"
+        )
+
+        bg, fg = COLOR_BG(), COLOR_TEXT()
+        pg.setConfigOptions(background=bg, foreground=fg)
+        self._plot_widget.setBackground(bg)
+        for plot_item, title in zip(
+            (self._x_plot, self._y_plot, self._angle_plot), self._PLOT_TITLES
+        ):
+            plot_item.setTitle(title, color=fg, size=self._PLOT_TITLE_SIZE)
+            for axis_name in ("left", "bottom"):
+                axis = plot_item.getAxis(axis_name)
+                axis.setPen(fg)
+                axis.setTextPen(fg)
+        self._x_curve.setPen(pg.mkPen(color=COLOR_AXIS_X(), width=2))
+        self._y_curve.setPen(pg.mkPen(color=COLOR_AXIS_Y(), width=2))
+        self._angle_curve.setPen(pg.mkPen(color=COLOR_AXIS_ANGLE(), width=2))
+
+        self._platform_view.update()
 
     def _connect_signals(self):
         self.refresh_button.clicked.connect(self._refresh_trajectory_list)
@@ -759,6 +799,7 @@ class TrajectoryScreen(QWidget):
 
     def _on_state_changed(self, state_name: str):
         self._refresh_controls()
+        self._joystick.refresh_controls()
         # HOME's limit-mapping sweep ends with the HOMING -> IDLE
         # transition — same trigger CalibrationMapWindow uses to refresh
         # its own view (see calibration_map_window.py), so the platform

@@ -1,11 +1,17 @@
 """
 connection_screen.py
 
-First screen: serial connection, homing, initial-position setup, and
-manual per-axis movement. Follows the pattern used throughout the
-project: this screen never talks to ESP32Controller directly — it goes
-through SystemStateMachine (via StateMachineBridge) so permission logic
-(can_move_manually(), can_home(), etc.) stays centralized in one place.
+First screen: serial connection, homing, and initial-position setup.
+Follows the pattern used throughout the project: this screen never
+talks to ESP32Controller directly — it goes through SystemStateMachine
+(via StateMachineBridge) so permission logic (can_home(), etc.) stays
+centralized in one place.
+
+Manual per-axis movement used to live here too ("Movimiento Manual");
+moved to TrajectoryScreen (2026-07-25+ redesign, Luis's request) as a
+directional joystick control overlaid on the platform visualization —
+see src/ui/manual_joystick.py. Nothing about how a move is validated or
+executed changed, only which screen/widget triggers it.
 
 Initial-position bookkeeping (which saved file, if any, the current
 fields correspond to) is written to a shared InitialPositionSession so
@@ -13,31 +19,28 @@ TrajectoryScreen can apply it as an offset and, once a run finishes,
 offer to save it — see src/controllers/initial_position_session.py.
 """
 
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QFont, QFontMetrics
+from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtGui import QDoubleValidator, QFont, QFontMetrics
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QPushButton, QLabel, QLineEdit, QGroupBox, QComboBox, QButtonGroup,
+    QPushButton, QLabel, QLineEdit, QGroupBox, QComboBox,
     QInputDialog, QMessageBox
 )
 
 from src.communication.protocol import Position
 from src.controllers.initial_position_session import InitialPositionSession
+from src.ui.action_worker import ActionWorker
 from src.ui.bridge import StateMachineBridge
+from src.ui.numeric_keypad import NumericKeypad
+from src.ui.theme_manager import ThemeManager
 from src.ui.style import (
-    BUTTON_STYLE, BUTTON_STYLE_PRIMARY, BUTTON_STYLE_COMPACT,
+    BUTTON_STYLE, BUTTON_STYLE_COMPACT,
     LAYOUT_SPACING, LAYOUT_MARGIN, FONT_SIZE_STATUS,
-    INPUT_STYLE, COLOR_ACCENT, COLOR_ACCENT_TEXT,
+    INPUT_STYLE,
 )
 from src.ui.limit_violation_dialog import LimitViolationDialog
 from src.utils import position_library, trajectory_generator
 from src.utils.trajectory_validator import PositionOutOfRangeError, check_position
-
-# Fixed manual-movement increments (cm for X/Y, degrees for A — the
-# same magnitudes read naturally in both units). Replaces a free-text
-# amount field: a small, professional-looking preset selector is less
-# error-prone on a touchscreen than typing an arbitrary number each time.
-MOVE_INCREMENTS = (1.0, 5.0, 10.0)
 
 # Spanish labels for calibration status messages, keyed by the axis
 # codes used throughout the protocol (Y/X/A — see docs/protocol.md).
@@ -112,36 +115,10 @@ class _AutoFitLabel(QLabel):
         self._apply_font_size(self._MIN_FONT_PX)
 
 
-class _ActionWorker(QThread):
-    """
-    Runs a single blocking state-machine action (home, move_relative,
-    etc.) on a background thread, so the UI stays responsive while
-    waiting for the ESP32's response/timeout.
-
-    This is intentionally minimal — a single-shot worker per action,
-    not a persistent command queue. If future screens need more
-    sophisticated sequencing (e.g. trajectory transfer with progress),
-    that will be designed separately rather than overloading this class.
-    """
-    succeeded = Signal()
-    failed = Signal(str)
-
-    def __init__(self, action_fn, parent=None):
-        super().__init__(parent)
-        self._action_fn = action_fn
-
-    def run(self):
-        try:
-            self._action_fn()
-            self.succeeded.emit()
-        except Exception as exc:
-            self.failed.emit(str(exc))
-
-
 class ConnectionScreen(QWidget):
     """
-    Screen for establishing the serial connection, homing, setting up
-    the initial position, and manual per-axis movement.
+    Screen for establishing the serial connection, homing, and setting
+    up the initial position.
 
     Args:
         bridge: The shared StateMachineBridge instance (created once
@@ -149,21 +126,33 @@ class ConnectionScreen(QWidget):
         position_session: The shared InitialPositionSession (also
                 owned by main_window.py), so TrajectoryScreen can see
                 what this screen sets up.
+        theme_manager: Shared ThemeManager — passed straight through to
+                NumericKeypad, the only widget on this screen that bakes
+                a color into its own stylesheet (this screen's own
+                buttons are all sizing-only styles, so they need no
+                re-application on a theme change — see style.py's
+                module docstring).
     """
+
+    # Emitted once "Ir a Posición Inicial" actually produces a real
+    # movement (not on a rejected/out-of-range attempt, and not on the
+    # no-op case where the target is already the current position) —
+    # main_window.py connects this to switching to the Monitor screen
+    # (2026-07-26+, Luis's explicit request), same cross-screen-
+    # navigation pattern as TrajectoryScreen.request_new_trial.
+    request_show_monitor = Signal()
 
     def __init__(
         self,
         bridge: StateMachineBridge,
         position_session: InitialPositionSession,
+        theme_manager: ThemeManager,
         parent=None,
     ):
         super().__init__(parent)
         self._bridge = bridge
         self._position_session = position_session
         self._worker = None  # keeps a reference so the QThread isn't GC'd mid-run
-
-        # Currently selected manual-move increment (cm/deg).
-        self._move_increment = MOVE_INCREMENTS[0]
 
         # True while a synchronized (0,0,0) -> initial-position trajectory
         # (see _on_goto_initial_synchronized) is running via send_trajectory()
@@ -172,6 +161,11 @@ class ConnectionScreen(QWidget):
         # TrajectoryScreen — both arrive on the same shared bridge signal.
         self._awaiting_initial_move = False
         self._pending_initial_position: Position | None = None
+
+        # Shared popup numeric keypad for the 3 initial-position fields
+        # (see _build_ui, where they're wired via installEventFilter) —
+        # one instance, redirected to whichever field last gained focus.
+        self._keypad = NumericKeypad(self, theme_manager)
 
         self._build_ui()
         self._connect_signals()
@@ -206,15 +200,16 @@ class ConnectionScreen(QWidget):
         status_layout.addWidget(self.status_label)
 
         # --- Connection / Home box ---
+        # "Conectar" used to live here as its own button; it was removed
+        # (2026-07-25+ kiosk pass) in favor of the unified ESP32
+        # connect/status button in the nav bar (see main_window.py,
+        # src/ui/status_indicator.py) — this box now only hosts Home.
         conn_box = QGroupBox("CONEXIÓN")
         conn_layout = QHBoxLayout(conn_box)
 
-        self.connect_button = QPushButton("Conectar")
-        self.connect_button.setStyleSheet(BUTTON_STYLE_PRIMARY)
         self.home_button = QPushButton("Calibrar (Home)")
         self.home_button.setStyleSheet(BUTTON_STYLE)
 
-        conn_layout.addWidget(self.connect_button)
         conn_layout.addWidget(self.home_button)
 
         # Fixed height, matched to conn_box's own natural size, so a
@@ -253,8 +248,18 @@ class ConnectionScreen(QWidget):
         self.pos_x_input = QLineEdit("0")
         self.pos_y_input = QLineEdit("0")
         self.pos_angle_input = QLineEdit("0")
+        # These 3 fields are purely numeric (decimal, possibly negative —
+        # e.g. calibrated angle bounds), so they get their own dedicated
+        # on-screen numeric keypad (see _keypad below) instead of relying
+        # on the OS virtual keyboard, whose show/hide integration proved
+        # unreliable to get right blind on this touchscreen. The OS
+        # keyboard is explicitly disabled for just these 3 fields
+        # (WA_InputMethodEnabled) so the two never compete.
         for edit in (self.pos_x_input, self.pos_y_input, self.pos_angle_input):
             edit.setStyleSheet(INPUT_STYLE)
+            edit.setValidator(QDoubleValidator(-1e6, 1e6, 4, edit))
+            edit.setAttribute(Qt.WA_InputMethodEnabled, False)
+            edit.installEventFilter(self)
 
         position_layout.addWidget(QLabel("X (cm):"), 1, 0)
         position_layout.addWidget(self.pos_x_input, 1, 1)
@@ -271,77 +276,39 @@ class ConnectionScreen(QWidget):
         self.goto_position_button.setStyleSheet(BUTTON_STYLE_COMPACT)
         position_layout.addWidget(self.goto_position_button, 2, 0, 1, 6)
 
-        # --- Manual movement grid ---
-        manual_box = QGroupBox("MOVIMIENTO MANUAL")
-        manual_layout = QGridLayout(manual_box)
-        manual_layout.setSpacing(LAYOUT_SPACING)
-
-        # Row 0: increment selector (1 / 5 / 10 cm or deg), shared by
-        # every axis — a small preset picker instead of a free-text
-        # amount, less error-prone on a touchscreen.
-        manual_layout.addWidget(QLabel("Incremento:"), 0, 0)
-        increments_row = QHBoxLayout()
-        self._increment_group = QButtonGroup(self)
-        self._increment_group.setExclusive(True)
-        for value in MOVE_INCREMENTS:
-            btn = QPushButton(f"{value:g}")
-            btn.setCheckable(True)
-            btn.setStyleSheet(self._increment_button_style())
-            btn.setChecked(value == self._move_increment)
-            btn.clicked.connect(lambda checked, v=value: self._on_increment_selected(v))
-            self._increment_group.addButton(btn)
-            increments_row.addWidget(btn)
-        manual_layout.addLayout(increments_row, 0, 1, 1, 2)
-
-        self.axis_buttons = {}  # (axis, direction) -> QPushButton
-        axes = [("X", "Horizontal"), ("Y", "Vertical"), ("A", "Sagital")]
-        for row, (axis_code, axis_label) in enumerate(axes, start=1):
-            manual_layout.addWidget(QLabel(axis_label), row, 0)
-
-            minus_btn = QPushButton(f"{axis_code} -")
-            minus_btn.setStyleSheet(BUTTON_STYLE_COMPACT)
-            minus_btn.clicked.connect(
-                lambda checked=False, a=axis_code: self._on_manual_move(a, "-")
-            )
-            manual_layout.addWidget(minus_btn, row, 1)
-            self.axis_buttons[(axis_code, "-")] = minus_btn
-
-            plus_btn = QPushButton(f"{axis_code} +")
-            plus_btn.setStyleSheet(BUTTON_STYLE_COMPACT)
-            plus_btn.clicked.connect(
-                lambda checked=False, a=axis_code: self._on_manual_move(a, "+")
-            )
-            manual_layout.addWidget(plus_btn, row, 2)
-            self.axis_buttons[(axis_code, "+")] = plus_btn
-
+        # Manual movement used to have its own box here ("MOVIMIENTO
+        # MANUAL") — now the joystick control in TrajectoryScreen (see
+        # src/ui/manual_joystick.py), so position_box is the only thing
+        # left in this row.
         bottom_row = QHBoxLayout()
         bottom_row.setSpacing(LAYOUT_SPACING)
-        bottom_row.addWidget(position_box, 3)
-        bottom_row.addWidget(manual_box, 2)
+        bottom_row.addWidget(position_box)
         root.addLayout(bottom_row)
 
         root.addStretch()
 
-    @staticmethod
-    def _increment_button_style() -> str:
-        """Same compact footprint as BUTTON_STYLE_COMPACT, plus a
-        visibly highlighted checked state (radio-button behavior)."""
-        return BUTTON_STYLE_COMPACT + f"""
-            QPushButton:checked {{
-                background-color: {COLOR_ACCENT};
-                color: {COLOR_ACCENT_TEXT};
-                font-weight: bold;
-            }}
+    def eventFilter(self, watched, event):
         """
+        Shows the numeric keypad when one of the 3 initial-position
+        fields gains focus (see _build_ui, where they're registered via
+        installEventFilter(self)) — a QLineEdit has no focus-in signal
+        of its own in Qt, so an event filter is the standard way to
+        observe it without subclassing the widget.
+        """
+        if event.type() == QEvent.FocusIn and watched in (
+            self.pos_x_input, self.pos_y_input, self.pos_angle_input,
+        ):
+            self._keypad.show_for(watched)
+        return super().eventFilter(watched, event)
 
     def _connect_signals(self):
-        self.connect_button.clicked.connect(self._on_connect_clicked)
         self.home_button.clicked.connect(self._on_home_clicked)
         self.refresh_positions_button.clicked.connect(self._refresh_position_list)
         self.load_position_button.clicked.connect(self._on_load_position_clicked)
         self.goto_position_button.clicked.connect(self._on_goto_position_clicked)
 
         self._bridge.state_changed.connect(self._on_state_changed)
+        self._bridge.connected.connect(self._on_connected)
         self._bridge.device_error.connect(self._on_device_error)
         self._bridge.disconnected.connect(self._on_disconnected)
         self._bridge.calibration_limit.connect(self._on_calibration_limit)
@@ -352,12 +319,16 @@ class ConnectionScreen(QWidget):
     # Actions
     # ------------------------------------------------------------------
 
-    def _on_connect_clicked(self):
-        controller = self._bridge.state_machine.controller
-        if not controller.is_connected:
-            controller.connect()
-            self.status_label.setText("Conectado (sin calibrar)")
-            self._bridge.notify_connected()
+    def _on_connected(self):
+        """
+        The actual connect() call now happens in the nav bar's unified
+        ESP32 button (src/ui/status_indicator.py) rather than a button
+        on this screen — this reacts to the same bridge.connected signal
+        that button's click fires, so this screen's own status text and
+        control-enabled state still update exactly as before (same text,
+        same _refresh_controls() call the old local click handler made).
+        """
+        self.status_label.setText("Conectado (sin calibrar)")
         self._refresh_controls()
 
     def _on_home_clicked(self):
@@ -506,10 +477,14 @@ class ConnectionScreen(QWidget):
                         f"No se puede establecer esa posición inicial: {exc}"
                     ) from exc
 
+            def on_success():
+                self._on_goto_succeeded(position)
+                self.request_show_monitor.emit()
+
             self._run_action(
                 action_fn,
                 success_message=f"En posición inicial: X={x:g} cm, Y={y:g} cm, Á={angle:g}°.",
-                on_success=lambda: self._on_goto_succeeded(position),
+                on_success=on_success,
             )
         else:
             self._on_goto_initial_synchronized(position)
@@ -585,79 +560,10 @@ class ConnectionScreen(QWidget):
         self._position_session.set(position)
         self._refresh_controls()
 
-    def _on_increment_selected(self, value: float):
-        self._move_increment = value
-
-    def _on_manual_move(self, axis: str, direction: str):
-        amount = self._move_increment
-
-        # Pre-check on the UI thread against the LOCALLY tracked
-        # position (same rationale/precedent as the X/angle-reference
-        # check in _refresh_controls below: a live GET_POSITION round
-        # trip here would freeze the UI) so an out-of-range increment
-        # can show the visual LimitViolationDialog with the actual
-        # target instead of a plain status string — move_relative()
-        # still re-validates for real via the background worker below,
-        # this is purely a presentation-layer preview of the same check.
-        sm = self._bridge.state_machine
-        current = self._position_session.position
-        space = sm.last_calibration_space
-        if current is not None and space is not None:
-            delta = amount if direction == "+" else -amount
-            target = Position(
-                x=current.x + delta if axis == "X" else current.x,
-                y=current.y + delta if axis == "Y" else current.y,
-                angle=current.angle + delta if axis == "A" else current.angle,
-            )
-            violations = check_position(target, space)
-            if violations:
-                LimitViolationDialog(
-                    space, "No se puede aplicar ese incremento manual",
-                    target, violations, parent=self,
-                ).exec()
-                return
-
-        def move():
-            try:
-                self._bridge.state_machine.move_relative(axis, direction, amount)
-            except PositionOutOfRangeError as exc:
-                raise RuntimeError(
-                    f"No se puede aplicar ese incremento manual: {exc}"
-                ) from exc
-
-        # No success_message here: the operator should see the resulting
-        # X/Y/Angle values change directly in the Posición Inicial fields
-        # (via _on_manual_move_succeeded below), not a "+5"/"-5" delta
-        # message in Estado del Sistema.
-        self._run_action(
-            move,
-            success_message=None,
-            on_success=lambda: self._on_manual_move_succeeded(axis, direction, amount),
-        )
-
-    def _on_manual_move_succeeded(self, axis: str, direction: str, amount: float):
-        """
-        Mirrors the just-applied delta into the session and the visible
-        fields in real time. MOVE_REL amounts are already in real units
-        (unlike step-based MANUAL), so this client-side accumulation
-        exactly mirrors the firmware's own tracked position — no
-        GET_POSITION round trip needed on every tap.
-        """
-        self._position_session.apply_manual_delta(axis, direction, amount)
-        position = self._position_session.position
-        if position is not None:
-            self.pos_x_input.setText(f"{position.x:g}")
-            self.pos_y_input.setText(f"{position.y:g}")
-            self.pos_angle_input.setText(f"{position.angle:g}")
-
     def _run_action(self, action_fn, success_message: str = "OK", on_success=None):
         """Run a blocking state-machine action on a background thread
-        so the UI does not freeze while waiting for the ESP32.
-
-        success_message may be None to skip updating the status label
-        entirely (used by manual moves, where the position fields
-        themselves are the intended feedback, not a status message)."""
-        self._worker = _ActionWorker(action_fn)
+        so the UI does not freeze while waiting for the ESP32."""
+        self._worker = ActionWorker(action_fn)
 
         def handle_success():
             if success_message is not None:
@@ -718,6 +624,7 @@ class ConnectionScreen(QWidget):
             f"Á={position.angle:g}°."
         )
         self._on_goto_succeeded(position)
+        self.request_show_monitor.emit()
 
     def _refresh_controls(self):
         """Enable/disable buttons based on what the state machine
@@ -725,37 +632,25 @@ class ConnectionScreen(QWidget):
         sm = self._bridge.state_machine
         controller = sm.controller
 
-        self.connect_button.setEnabled(not controller.is_connected)
         self.home_button.setEnabled(controller.is_connected and sm.can_home())
 
         can_goto = controller.is_connected and sm.can_go_to_position()
         self.goto_position_button.setEnabled(can_goto)
 
-        # Also requires an initial position to already be established
-        # (via "Ir a Posición Inicial") — nudging before that would move
-        # the device from an undefined reference point with no way to
-        # reflect the result in the UI (see _on_goto_succeeded).
-        can_move = sm.can_move_manually() and self._position_session.position is not None
-        # X specifically also requires the angle to already be at
-        # ANGLE_REFERENCE_DEG (X travel is only mechanically safe
-        # there — see SystemStateMachine.move_relative()'s docstring).
-        # Compared against the LOCALLY tracked position (kept in sync
-        # by _on_manual_move_succeeded/_on_goto_succeeded), not a live
-        # GET_POSITION query — this runs on the UI thread on every
-        # state change, and a real serial round-trip here would freeze
-        # it (unlike move_relative()'s own defensive check, which runs
-        # on the background action-worker thread).
-        can_move_x = can_move and (
-            abs(self._position_session.position.angle - sm.ANGLE_REFERENCE_DEG)
-            <= sm.ANGLE_REFERENCE_TOLERANCE_DEG
-        )
-        for (axis, _direction), button in self.axis_buttons.items():
-            enabled = can_move_x if axis == "X" else can_move
-            button.setEnabled(enabled)
-            if not can_move:
-                tooltip = "Primero presiona 'Ir a Posición Inicial'."
-            elif axis == "X" and not can_move_x:
-                tooltip = "Endereza primero el ángulo (referencia) para poder mover X."
-            else:
-                tooltip = ""
-            button.setToolTip(tooltip)
+    def showEvent(self, event):
+        """
+        Refreshes the 3 position fields from the shared session whenever
+        this screen becomes visible — needed since manual moves now
+        happen from TrajectoryScreen's joystick control (see
+        src/ui/manual_joystick.py), which updates position_session
+        directly but has no way to reach these fields itself. Mirrors
+        what the old local _on_manual_move_succeeded used to do inline,
+        just triggered by visibility instead of by the move handler
+        that no longer lives on this screen.
+        """
+        super().showEvent(event)
+        position = self._position_session.position
+        if position is not None:
+            self.pos_x_input.setText(f"{position.x:g}")
+            self.pos_y_input.setText(f"{position.y:g}")
+            self.pos_angle_input.setText(f"{position.angle:g}")

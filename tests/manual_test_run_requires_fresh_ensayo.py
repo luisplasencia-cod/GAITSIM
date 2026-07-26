@@ -31,6 +31,7 @@ from src.controllers.initial_position_session import InitialPositionSession
 from src.controllers.system_state import CalibrationSpace, SystemState, SystemStateMachine
 from src.ui.bridge import StateMachineBridge
 from src.ui.screens.trajectory_screen import TrajectoryScreen
+from src.ui.theme_manager import ThemeManager
 
 SPACE = CalibrationSpace(
     y_min=0.0, y_max=40.0, x_min=0.0, x_max=30.0, angle_min=-20.0, angle_max=20.0
@@ -64,7 +65,7 @@ def make_state_machine():
 def make_trajectory_screen(sm: SystemStateMachine, position=None) -> TrajectoryScreen:
     bridge = StateMachineBridge(sm)
     session = InitialPositionSession(position=position)
-    return TrajectoryScreen(bridge, session)
+    return TrajectoryScreen(bridge, session, ThemeManager())
 
 
 def test_run_disabled_before_any_csv_sent():

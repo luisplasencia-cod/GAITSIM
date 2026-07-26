@@ -31,6 +31,7 @@ from src.controllers.initial_position_session import InitialPositionSession
 from src.controllers.system_state import SystemStateMachine
 from src.ui.bridge import StateMachineBridge
 from src.ui.screens.trajectory_screen import TrajectoryScreen
+from src.ui.theme_manager import ThemeManager
 
 _failures = 0
 
@@ -49,7 +50,7 @@ def make_screen(position) -> TrajectoryScreen:
     sm = SystemStateMachine(controller)
     bridge = StateMachineBridge(sm)
     session = InitialPositionSession(position=position)
-    return TrajectoryScreen(bridge, session)
+    return TrajectoryScreen(bridge, session, ThemeManager())
 
 
 def test_angle_no_jump_current_zero_csv_negative():

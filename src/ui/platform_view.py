@@ -218,7 +218,7 @@ class PlatformView(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.fillRect(self.rect(), QColor(COLOR_BG))
+        painter.fillRect(self.rect(), QColor(COLOR_BG()))
 
         origin = self._origin_screen_point()
         center = self._to_screen(self._x_cm, self._y_cm)
@@ -277,10 +277,10 @@ class PlatformView(QWidget):
         far = self._to_screen(space.x_max, space.y_max)
         rect = QRectF(origin.x(), far.y(), far.x() - origin.x(), origin.y() - far.y())
 
-        fill = QColor(COLOR_AXIS_X)
+        fill = QColor(COLOR_AXIS_X())
         fill.setAlpha(25)
         painter.setBrush(QBrush(fill))
-        pen = QPen(QColor(COLOR_AXIS_X))
+        pen = QPen(QColor(COLOR_AXIS_X()))
         pen.setStyle(Qt.DashLine)
         pen.setWidth(1)
         painter.setPen(pen)
@@ -297,7 +297,7 @@ class PlatformView(QWidget):
         # angle-zero conventions in the same drawing).
         radius = 65.0 * 1.15
         arc_rect = QRectF(center.x() - radius, center.y() - radius, 2 * radius, 2 * radius)
-        arc_pen = QPen(QColor(COLOR_AXIS_ANGLE))
+        arc_pen = QPen(QColor(COLOR_AXIS_ANGLE()))
         arc_pen.setStyle(Qt.DashLine)
         arc_pen.setWidth(1)
         painter.setPen(arc_pen)
@@ -321,7 +321,7 @@ class PlatformView(QWidget):
             x_px = origin.x() + cm * scale
             is_major = cm % major_step_cm == 0
             tick_h = 10 if is_major else 5
-            pen = QPen(QColor(COLOR_AXIS_X))
+            pen = QPen(QColor(COLOR_AXIS_X()))
             pen.setWidth(2 if is_major else 1)
             painter.setPen(pen)
             painter.drawLine(QPointF(x_px, origin.y() - tick_h), QPointF(x_px, origin.y() + tick_h))
@@ -340,7 +340,7 @@ class PlatformView(QWidget):
         drift into the angle indicator or off past the ruler as the
         platform moves, which is more clutter than clarity."""
         ground_point = QPointF(center.x(), origin.y())
-        pen = QPen(QColor(COLOR_AXIS_Y))
+        pen = QPen(QColor(COLOR_AXIS_Y()))
         pen.setStyle(Qt.DashLine)
         pen.setWidth(2)
         painter.setPen(pen)
@@ -366,12 +366,12 @@ class PlatformView(QWidget):
         painter.save()
         painter.translate(center)
 
-        ref_pen = QPen(QColor(COLOR_TEXT_MUTED))
+        ref_pen = QPen(QColor(COLOR_TEXT_MUTED()))
         ref_pen.setStyle(Qt.DashLine)
         painter.setPen(ref_pen)
         painter.drawLine(QPointF(0, 0), QPointF(radius * 1.3, 0))
 
-        needle_pen = QPen(QColor(COLOR_AXIS_ANGLE), 2)
+        needle_pen = QPen(QColor(COLOR_AXIS_ANGLE()), 2)
         painter.setPen(needle_pen)
         painter.save()
         painter.rotate(-self._angle_deg)
@@ -390,12 +390,12 @@ class PlatformView(QWidget):
         carry no text of their own now that per-frame labels were
         removed as clutter (see _draw_y_guide/_draw_angle_indicator)."""
         entries = [
-            (COLOR_AXIS_X, "— posición horizontal (X)"),
-            (COLOR_AXIS_Y, "┆ altura (Y)"),
-            (COLOR_AXIS_ANGLE, "◠ inclinación (ángulo)"),
+            (COLOR_AXIS_X(), "— posición horizontal (X)"),
+            (COLOR_AXIS_Y(), "┆ altura (Y)"),
+            (COLOR_AXIS_ANGLE(), "◠ inclinación (ángulo)"),
         ]
         if self._space is not None:
-            entries.append((COLOR_AXIS_X, "▭ límite calibrado (Espacio Disponible)"))
+            entries.append((COLOR_AXIS_X(), "▭ límite calibrado (Espacio Disponible)"))
         x, y = 10, 10
         row_h = 18
         # Box width fits the widest entry — a fixed 210px (enough for the
@@ -413,7 +413,7 @@ class PlatformView(QWidget):
             painter.drawText(QRectF(x, y + i * row_h, text_width, row_h), Qt.AlignVCenter, text)
 
     def _draw_grid(self, painter: QPainter):
-        pen = QPen(QColor(COLOR_BORDER))
+        pen = QPen(QColor(COLOR_BORDER()))
         pen.setWidth(1)
         painter.setPen(pen)
         step = int(10 * PX_PER_CM)  # a line every 10cm
@@ -425,12 +425,12 @@ class PlatformView(QWidget):
             painter.drawLine(0, gy, self.width(), gy)
 
     def _draw_ground_line(self, painter: QPainter, origin: QPointF):
-        pen = QPen(QColor(COLOR_TEXT_MUTED))
+        pen = QPen(QColor(COLOR_TEXT_MUTED()))
         pen.setWidth(2)
         pen.setStyle(Qt.DashLine)
         painter.setPen(pen)
         painter.drawLine(QPointF(0, origin.y()), QPointF(self.width(), origin.y()))
-        painter.setPen(QColor(COLOR_TEXT_MUTED))
+        painter.setPen(QColor(COLOR_TEXT_MUTED()))
         painter.drawText(
             QRectF(8, origin.y() + 4, 200, 20), Qt.AlignLeft, "Y = 0 (piso de referencia)"
         )
@@ -442,10 +442,10 @@ class PlatformView(QWidget):
         # (COLOR_TEXT, not COLOR_AXIS_X) so it never gets mistaken for
         # one of the 3 axis readouts.
         radius = 7
-        painter.setPen(QPen(QColor(COLOR_TEXT), 2))
-        painter.setBrush(QBrush(QColor(COLOR_TEXT)))
+        painter.setPen(QPen(QColor(COLOR_TEXT()), 2))
+        painter.setBrush(QBrush(QColor(COLOR_TEXT())))
         painter.drawEllipse(origin, radius, radius)
-        painter.setPen(QColor(COLOR_TEXT_MUTED))
+        painter.setPen(QColor(COLOR_TEXT_MUTED()))
         # Above the marker (not to the side) so it doesn't collide with
         # the platform when it's near HOME — the common case right
         # after homing or when returning to a nearby initial position.
@@ -482,14 +482,14 @@ class PlatformView(QWidget):
         painter.rotate(-self._angle_deg)
 
         rect = QRectF(-half_len_px, -half_thick_px, 2 * half_len_px, 2 * half_thick_px)
-        painter.setPen(QPen(QColor(COLOR_BORDER), 1))
-        painter.setBrush(QBrush(QColor(COLOR_PLATFORM_FILL)))
+        painter.setPen(QPen(QColor(COLOR_BORDER()), 1))
+        painter.setBrush(QBrush(QColor(COLOR_PLATFORM_FILL())))
         painter.drawRoundedRect(rect, 4, 4)
 
         # A thin darker underside strip suggests thickness/depth without
         # needing an actual 3rd dimension.
         underside = QRectF(-half_len_px, half_thick_px - 3, 2 * half_len_px, 4)
-        painter.setBrush(QBrush(QColor(COLOR_PLATFORM_UNDERSIDE)))
+        painter.setBrush(QBrush(QColor(COLOR_PLATFORM_UNDERSIDE())))
         painter.setPen(Qt.NoPen)
         painter.drawRoundedRect(underside, 2, 2)
 

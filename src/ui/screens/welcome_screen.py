@@ -138,7 +138,7 @@ class _TapHint(QWidget):
         font.setPointSize(FONT_SIZE_HINT)
         font.setLetterSpacing(QFont.AbsoluteSpacing, 2)
         label.setFont(font)
-        label.setStyleSheet(f"color: {COLOR_TEXT_MUTED};")
+        label.setStyleSheet(f"color: {COLOR_TEXT_MUTED()};")
         layout.addWidget(label, alignment=Qt.AlignVCenter)
 
     def start_pulse(self):
@@ -177,7 +177,7 @@ class _LeftPanel(QWidget):
         # minus its margins without QLabel silently clipping the text.
         wordmark_font.setLetterSpacing(QFont.AbsoluteSpacing, 3)
         self.wordmark.setFont(wordmark_font)
-        self.wordmark.setStyleSheet(f"color: {COLOR_TEXT};")
+        self.wordmark.setStyleSheet(f"color: {COLOR_TEXT()};")
 
         self.tagline = QLabel(APP_TAGLINE.upper())
         # Wraps rather than relying on a precisely-tuned font size to
@@ -190,7 +190,7 @@ class _LeftPanel(QWidget):
         tagline_font.setPointSize(FONT_SIZE_SUBTITLE)
         tagline_font.setLetterSpacing(QFont.AbsoluteSpacing, 2)
         self.tagline.setFont(tagline_font)
-        self.tagline.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; margin-top: 10px;")
+        self.tagline.setStyleSheet(f"color: {COLOR_TEXT_MUTED()}; margin-top: 10px;")
 
         layout.addWidget(self.wordmark)
         layout.addWidget(self.tagline)
@@ -201,11 +201,11 @@ class _LeftPanel(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(COLOR_BG))
+        painter.fillRect(self.rect(), QColor(COLOR_BG()))
 
         # Faint blueprint-style grid — evokes an engineering drawing;
         # low-contrast enough to read as texture, not a literal grid.
-        grid_color = QColor(COLOR_BORDER)
+        grid_color = QColor(COLOR_BORDER())
         grid_color.setAlpha(60)
         painter.setPen(QPen(grid_color, 1))
         for gx in range(0, self.width(), GRID_SPACING_PX):
@@ -235,7 +235,7 @@ class WelcomeScreen(QWidget):
         self._build_ui()
 
     def _build_ui(self):
-        self.setStyleSheet(f"background-color: {COLOR_BG};")
+        self.setStyleSheet(f"background-color: {COLOR_BG()};")
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -279,7 +279,7 @@ class WelcomeScreen(QWidget):
 
         width, height = VIDEO_DISPLAY_SIZE
         scene = self._video_scene = QGraphicsScene(self)
-        scene.setBackgroundBrush(QColor(COLOR_BG))
+        scene.setBackgroundBrush(QColor(COLOR_BG()))
         item = QGraphicsVideoItem()
         item.setSize(QSizeF(width, height))
         scene.addItem(item)
@@ -290,7 +290,7 @@ class WelcomeScreen(QWidget):
         # video item (not a separate overlay widget), so it composites
         # for free through whatever backend renders QGraphicsVideoItem.
         feather = QGraphicsRectItem(0, 0, VIDEO_FEATHER_PX, height)
-        bg = QColor(COLOR_BG)
+        bg = QColor(COLOR_BG())
         transparent_bg = QColor(bg)
         transparent_bg.setAlpha(0)
         gradient = QLinearGradient(0, 0, VIDEO_FEATHER_PX, 0)
@@ -311,7 +311,7 @@ class WelcomeScreen(QWidget):
         view.setInteractive(False)
         # No border/frame (unlike the pre-redesign boxed preview) — the
         # feather gradient above does the visual-integration work instead.
-        view.setStyleSheet(f"background-color: {COLOR_BG}; border: none;")
+        view.setStyleSheet(f"background-color: {COLOR_BG()}; border: none;")
         # Mouse events must reach WelcomeScreen.mousePressEvent (tap
         # anywhere, including over the video, advances past this screen).
         view.setAttribute(Qt.WA_TransparentForMouseEvents, True)
@@ -329,7 +329,7 @@ class WelcomeScreen(QWidget):
         # screen height, letterboxing top/bottom against COLOR_BG rather
         # than stretching/cropping — same aspect ratio as the source.
         container = QWidget()
-        container.setStyleSheet(f"background-color: {COLOR_BG};")
+        container.setStyleSheet(f"background-color: {COLOR_BG()};")
         vlayout = QVBoxLayout(container)
         vlayout.setContentsMargins(0, 0, 0, 0)
         vlayout.addStretch(1)

@@ -84,7 +84,7 @@ class LimitViolationDialog(QDialog):
         heading = QLabel(context_message)
         heading.setStyleSheet(
             f"font-size: {FONT_SIZE_NORMAL}px; font-weight: bold; "
-            f"color: {STATUS_COLORS['ERROR']};"
+            f"color: {STATUS_COLORS()['ERROR']};"
         )
         heading.setWordWrap(True)
         root.addWidget(heading)
@@ -93,7 +93,7 @@ class LimitViolationDialog(QDialog):
         if extra_note:
             detail_text += f" ({extra_note})"
         detail = QLabel(detail_text)
-        detail.setStyleSheet(f"font-size: {FONT_SIZE_NORMAL}px; color: {COLOR_TEXT};")
+        detail.setStyleSheet(f"font-size: {FONT_SIZE_NORMAL}px; color: {COLOR_TEXT()};")
         detail.setWordWrap(True)
         root.addWidget(detail)
 
@@ -105,7 +105,7 @@ class LimitViolationDialog(QDialog):
         button_row = QHBoxLayout()
         button_row.addStretch()
         ok_button = QPushButton("Entendido y corregir")
-        ok_button.setStyleSheet(BUTTON_STYLE_PRIMARY)
+        ok_button.setStyleSheet(BUTTON_STYLE_PRIMARY())
         ok_button.clicked.connect(self.accept)
         button_row.addWidget(ok_button)
         root.addLayout(button_row)
