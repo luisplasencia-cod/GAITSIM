@@ -1,275 +1,310 @@
-# Gait Simulator — Serial Communication Protocol
+# Gait Simulator — Protocolo de Comunicación Serial
 
-This document specifies the contract between the Raspberry Pi
-(high-level controller) and the ESP32 (real-time controller). Any
-firmware implementation (test or production) must comply with this
-specification for the rest of the software stack to work unmodified.
+Este documento especifica el contrato entre la Raspberry Pi
+(controlador de alto nivel) y el ESP32 (controlador en tiempo real).
+Cualquier implementación de firmware (de prueba o definitiva) debe
+cumplir esta especificación para que el resto del stack de software
+funcione sin modificaciones.
 
-## Transport
+## Transporte
 
-- Physical link: USB Serial
+- Enlace físico: USB Serial
 - Baud rate: 115200
-- Roles: Raspberry Pi is master (sends commands), ESP32 is slave
-  (executes and responds)
-- **RPi -> ESP32 commands**: framed with literal `<` and `>` delimiters,
-  no trailing `\n` — e.g. `PING` is sent on the wire as `<PING>`. The
-  ESP32 reads from `<` to `>` as one complete command (matching the
-  general-purpose receive function used on the ESP32 side). Every
-  `Format` cell below for an RPi -> ESP32 command shows only the
-  payload; wrap it in `<` `>` to get the actual bytes sent.
-- **ESP32 -> RPi responses**: unaffected by the above — plain ASCII
-  text, one response per line, terminated with `\n`, exactly as shown
-  in the `Response`/`Format` cells below.
-- **Argument types (RPi -> ESP32 commands with 2+ arguments)**: the
-  first argument may be a string (e.g. `axis`); every argument after
-  the first must be numeric — either an integer, or (as with
-  `TRAJ_POINT`/`GOTO`, where every argument is already numeric) a
-  float. No command may carry a second textual/categorical argument —
-  e.g. `MANUAL`/`MOVE_REL`'s `direction` is an integer (`1`/`0`), not
-  `+`/`-` text, precisely so it isn't a second string argument. This
-  matches the ESP32-side general-purpose receive function, which parses
-  argument 0 as a string and every argument after it as numeric.
+- Roles: la Raspberry Pi es maestra (envía comandos), el ESP32 es
+  esclavo (ejecuta y responde)
+- **Comandos RPi -> ESP32**: enmarcados con los delimitadores literales
+  `<` y `>`, sin `\n` al final — ej. `PING` se envía por el cable como
+  `<PING>`. El ESP32 lee desde `<` hasta `>` como un comando completo
+  (coincide con la función genérica de recepción usada en el lado
+  ESP32). Cada celda `Format` de abajo para un comando RPi -> ESP32
+  muestra solo el payload; hay que envolverlo en `<` `>` para obtener
+  los bytes reales enviados.
+- **Respuestas ESP32 -> RPi**: no afectadas por lo anterior — texto
+  ASCII plano, una respuesta por línea, terminada en `\n`, exactamente
+  como se muestra en las celdas `Response`/`Format` de abajo.
+- **Tipos de argumento (comandos RPi -> ESP32 con 2+ argumentos)**: el
+  primer argumento puede ser un string (ej. `axis`); todo argumento
+  después del primero debe ser numérico — entero, o (como en
+  `TRAJ_POINT`/`GOTO`, donde todos los argumentos ya son numéricos) un
+  float. Ningún comando puede llevar un segundo argumento textual/
+  categórico — ej. el `direction` de `MANUAL`/`MOVE_REL` es un entero
+  (`1`/`0`), no texto `+`/`-`, precisamente para que no sea un segundo
+  argumento de tipo string. Esto coincide con la función genérica de
+  recepción del lado ESP32, que parsea el argumento 0 como string y
+  cada argumento posterior como numérico.
 
-## System Commands
+## Comandos del Sistema
 
-| Command | Direction | Format | Response |
+| Comando | Dirección | Formato | Respuesta |
 |---|---|---|---|
 | Ping | RPi -> ESP32 | `<PING>` | `PONG` |
-| Home | RPi -> ESP32 | `<HOME>` | `READY` on success, `ERROR:<code>:<msg>` on failure |
-| Status query | RPi -> ESP32 | `<STATUS>` | `STATUS:<state>` |
+| Home | RPi -> ESP32 | `<HOME>` | `READY` si tiene éxito, `ERROR:<code>:<msg>` si falla |
+| Consulta de estado | RPi -> ESP32 | `<STATUS>` | `STATUS:<state>` |
 
-## Calibration Events (unsolicited, during HOMING)
+`<state>` debe ser uno de los siguientes 6 valores — los mismos
+estados que usa el `SystemStateMachine` de la Raspberry Pi (ver la
+sección "State machine states" de CLAUDE.md), así que el firmware debe
+mantener un enum interno que refleje esto y simplemente reportar el
+valor que esté activo en cada momento (no hace falta lógica adicional
+en el handler, ver `handleStatus()` del firmware de prueba en
+`firmware/gaitsim-esp32-test/main.cpp` como referencia):
 
-`<HOME>` triggers homing AND a full limit-mapping sweep of the 3 axes,
-in a fixed order: **Y, then X, then Angular**. While `HOMING`, before
-the final `READY`, the ESP32 emits a sequence of unsolicited events per
-axis so the Raspberry Pi can compute the available range of movement —
-same spirit as `TRAJ_PROGRESS` during `RUNNING`.
+| `<state>` | Cuándo el ESP32 debe estar en este estado |
+|---|---|
+| `DISCONNECTED` | Estado inicial al arrancar, antes de que `HOME` haya tenido éxito al menos una vez en esta sesión |
+| `HOMING` | Mientras ejecuta el barrido de calibración, entre recibir `<HOME>` y enviar `READY` |
+| `IDLE` | Homed, sin ejecutar trayectoria, sin recibir trayectoria — listo para `MANUAL`/`GOTO`/`TRAJ_BEGIN` |
+| `RECEIVING_TRAJECTORY` | Entre `<TRAJ_BEGIN>` y `<TRAJ_END>` |
+| `RUNNING` | Después de `<RUN>`, antes de `FINISHED`/`PAUSED`/`ABORTED` |
+| `PAUSED` | Después de `<PAUSE>` o `<STOP>`, antes de `<RESUME>` o `<ABORT>` |
 
-**Framing exception**: unlike every other ESP32 -> RPi response (which
-is unframed plain text, see Transport), these calibration events ARE
-wrapped in `<` `>`, and `CAL_PROGRESS`'s two arguments follow the same
-string-first/numeric-rest, colon-separated shape as multi-argument
-RPi -> ESP32 commands like `MANUAL`/`MOVE_REL` — by explicit request,
-so this argument convention is applied uniformly regardless of
-direction. This deliberately does NOT apply retroactively to existing
-responses (`READY`, `TRAJ_PROGRESS`, `POSITION`, `STATUS`, `ACK`,
-`ERROR`, etc.) — those remain unframed as documented under Transport.
+## Eventos de Calibración (no solicitados, durante HOMING)
 
-| Response | Format | Notes |
+`<HOME>` dispara el homing Y un barrido completo de mapeo de límites
+de los 3 ejes, en un orden fijo: **Y, luego X, luego Angular**.
+Mientras está en `HOMING`, antes del `READY` final, el ESP32 emite una
+secuencia de eventos no solicitados por eje para que la Raspberry Pi
+pueda calcular el rango disponible de movimiento — mismo espíritu que
+`TRAJ_PROGRESS` durante `RUNNING`.
+
+**Excepción de enmarcado**: a diferencia de cualquier otra respuesta
+ESP32 -> RPi (que es texto plano sin marco, ver Transporte), estos
+eventos de calibración SÍ están envueltos en `<` `>`, y los dos
+argumentos de `CAL_PROGRESS` siguen la misma forma string-primero/
+numérico-el-resto, separada por dos puntos, que los comandos RPi ->
+ESP32 con múltiples argumentos como `MANUAL`/`MOVE_REL` — por pedido
+explícito, para que esta convención de argumentos se aplique de forma
+uniforme sin importar la dirección. Esto deliberadamente NO se aplica
+retroactivamente a respuestas existentes (`READY`, `TRAJ_PROGRESS`,
+`POSITION`, `STATUS`, `ACK`, `ERROR`, etc.) — esas siguen sin marco,
+como está documentado en Transporte.
+
+| Respuesta | Formato | Notas |
 |---|---|---|
-| Min limit reached | `<LIM{AXIS}MIN>` | No arguments. Defines that axis's raw zero. One of `<LIMYMIN>`, `<LIMXMIN>`, `<LIMANGMIN>`. |
-| Travel progress | `<CAL_PROGRESS:axis:value>` | `axis` (string, first argument) one of `Y`/`X`/`A`. `value` (numeric, second argument) is the distance covered so far from that axis's min, in real units (cm for Y/X, degrees for `A`) — same unit convention as `GET_POSITION`/`GOTO`, never raw motor steps (see Absolute Positioning Commands). Sent repeatedly while traveling toward the max limit. |
-| Max limit reached | `<LIM{AXIS}MAX:value>` | Single numeric argument: the final measured range for that axis (same units as `CAL_PROGRESS`) — authoritative regardless of whether every intermediate `CAL_PROGRESS` tick was received. One of `<LIMYMAX:value>`, `<LIMXMAX:value>`, `<LIMANGMAX:value>`. |
+| Límite mínimo alcanzado | `<LIM{AXIS}MIN>` | Sin argumentos. Define el cero crudo de ese eje. Uno de `<LIMYMIN>`, `<LIMXMIN>`, `<LIMANGMIN>`. |
+| Progreso de recorrido | `<CAL_PROGRESS:axis:value>` | `axis` (string, primer argumento) uno de `Y`/`X`/`A`. `value` (numérico, segundo argumento) es la distancia recorrida hasta ahora desde el mínimo de ese eje, en unidades reales (cm para Y/X, grados para `A`) — misma convención de unidades que `GET_POSITION`/`GOTO`, nunca pasos crudos de motor (ver Comandos de Posicionamiento Absoluto). Se envía repetidamente mientras viaja hacia el límite máximo. |
+| Límite máximo alcanzado | `<LIM{AXIS}MAX:value>` | Un solo argumento numérico: el rango final medido para ese eje (mismas unidades que `CAL_PROGRESS`) — autoritativo sin importar si se recibió cada `CAL_PROGRESS` intermedio. Uno de `<LIMYMAX:value>`, `<LIMXMAX:value>`, `<LIMANGMAX:value>`. |
 
-All 3 axes are reported RAW/limit-relative on the wire — `[0, value]`.
-Sequence for a full `HOME`:
+Los 3 ejes se reportan en crudo/relativo-al-límite en el cable —
+`[0, value]`. Secuencia para un `HOME` completo:
 
 ```
 <LIMYMIN>
-<CAL_PROGRESS:Y:...>   (repeated)
+<CAL_PROGRESS:Y:...>   (repetido)
 <LIMYMAX:y_range>
 <LIMXMIN>
-<CAL_PROGRESS:X:...>   (repeated)
+<CAL_PROGRESS:X:...>   (repetido)
 <LIMXMAX:x_range>
 <LIMANGMIN>
-<CAL_PROGRESS:A:...>   (repeated)
+<CAL_PROGRESS:A:...>   (repetido)
 <LIMANGMAX:a_range>
 READY
 ```
 
-The Raspberry Pi combines the 3 per-axis raw ranges into the full
-available movement-space map. This whole sequence happens once per
-`HOME` call (itself only once per session — see
-`SystemStateMachine.can_home()`). Note `READY` itself, closing out the
-sequence, stays unframed — it is the pre-existing `HOME` response, not
-one of the new calibration events.
+La Raspberry Pi combina los 3 rangos crudos por eje en el mapa
+completo del espacio de movimiento disponible. Toda esta secuencia
+ocurre una vez por llamada a `HOME` (que a su vez solo ocurre una vez
+por sesión — ver `SystemStateMachine.can_home()`). Notar que `READY`
+mismo, que cierra la secuencia, se mantiene sin marco — es la
+respuesta preexistente de `HOME`, no uno de los nuevos eventos de
+calibración.
 
-**Angular axis is relative to horizontal, applied on the RPi side —
-NOT a wire-format concern**: `LIMANGMIN`'s raw `0` is where the
-*mechanical limit switch* is touched, which is NOT the same as level/
-horizontal — there's a real physical offset between the two. Rather
-than complicate the wire protocol (which stays uniform across all 3
-axes, as above), the Raspberry Pi applies a single fixed offset once,
-when reducing the raw `[0, a_range]` sweep into the final available-
-space map, so the reported angle range ends up relative to horizontal
-instead of relative to the limit switch. See
-`SystemStateMachine.ANGLE_HORIZONTAL_OFFSET_DEG` in `system_state.py`
-for the current placeholder value (`-44.0`) and
-`SystemStateMachine.CalibrationSpace` for where it's applied.
+**El eje angular es relativo a la horizontal, aplicado del lado de la
+RPi — NO es una preocupación del formato de cable**: el `0` crudo de
+`LIMANGMIN` es donde se toca el *límite mecánico (limit switch)*, que
+NO es lo mismo que nivelado/horizontal — hay un offset físico real
+entre ambos. En vez de complicar el protocolo de cable (que se
+mantiene uniforme entre los 3 ejes, como arriba), la Raspberry Pi
+aplica un único offset fijo, al reducir el barrido crudo `[0, a_range]`
+al mapa final de espacio disponible, de modo que el rango de ángulo
+reportado termine siendo relativo a la horizontal en vez de relativo
+al limit switch. Ver `SystemStateMachine.ANGLE_HORIZONTAL_OFFSET_DEG`
+en `system_state.py` para el valor placeholder actual (`-44.0`) y
+`SystemStateMachine.CalibrationSpace` para dónde se aplica.
 
-**Provisional**: like `TRAJ_PROGRESS`, the exact `CAL_PROGRESS` cadence
-and per-axis simulated range are defined by the test firmware
-(`firmware/gaitsim-esp32-test/main.cpp`) purely to exercise this flow
-end-to-end and do not represent real homing timing or real mechanical
-limits. The definitive firmware (Horizon 2) is expected to emit the
-same event structure (`LIM*MIN`, `CAL_PROGRESS`, `LIM*MAX`) with real
-timing and real limit-switch-derived values.
+**Provisional**: al igual que `TRAJ_PROGRESS`, la cadencia exacta de
+`CAL_PROGRESS` y el rango simulado por eje están definidos por el
+firmware de prueba (`firmware/gaitsim-esp32-test/main.cpp`)
+puramente para ejercitar este flujo de punta a punta, y no representan
+el timing real de homing ni los límites mecánicos reales. Se espera
+que el firmware definitivo (Horizonte 2) emita la misma estructura de
+eventos (`LIM*MIN`, `CAL_PROGRESS`, `LIM*MAX`) con timing real y
+valores derivados de los limit switches reales.
 
-## Manual Movement Commands
+## Comandos de Movimiento Manual
 
-Only valid when the system is NOT calibrating and NOT running a trajectory.
+Solo válidos cuando el sistema NO está calibrando y NO está ejecutando
+una trayectoria.
 
-| Command | Format | Response |
+| Comando | Formato | Respuesta |
 |---|---|---|
-| Manual move | `<MANUAL:axis:direction:steps>` | `OK` or `ERROR:<code>:<msg>` |
+| Movimiento manual | `<MANUAL:axis:direction:steps>` | `OK` o `ERROR:<code>:<msg>` |
 | Stop | `<STOP>` | `STOPPED` |
 
-- `<axis>`: `X` (horizontal), `Y` (vertical), `A` (sagittal angle)
-- `<direction>`: integer, `1` = `+`, `0` = `-` (see Transport note on
-  argument types below)
-- `<steps>`: positive integer
+- `<axis>`: `X` (horizontal), `Y` (vertical), `A` (ángulo sagital)
+- `<direction>`: entero, `1` = `+`, `0` = `-` (ver la nota de
+  Transporte sobre tipos de argumento arriba)
+- `<steps>`: entero positivo
 
-## Relative Movement Commands (real units)
+## Comandos de Movimiento Relativo (unidades reales)
 
-An alternative to `MANUAL` for callers that want to move by a known
-real-world amount (cm/deg) instead of raw motor steps — used by the
-Raspberry Pi's manual-adjustment buttons once a reference position
-exists (after `HOME` and/or `GOTO`). Only valid when the system is
-IDLE, same restriction as `MANUAL`.
+Una alternativa a `MANUAL` para quien quiera moverse una cantidad real
+conocida (cm/grados) en vez de pasos crudos de motor — usado por los
+botones de ajuste manual de la Raspberry Pi una vez que existe una
+posición de referencia (después de `HOME` y/o `GOTO`). Solo válido
+cuando el sistema está IDLE, misma restricción que `MANUAL`.
 
-| Command | Format | Response |
+| Comando | Formato | Respuesta |
 |---|---|---|
-| Move relative | `<MOVE_REL:axis:direction:amount>` | `OK` or `ERROR:<code>:<msg>` |
+| Movimiento relativo | `<MOVE_REL:axis:direction:amount>` | `OK` o `ERROR:<code>:<msg>` |
 
-- `<axis>`, `<direction>`: same meaning and encoding as `MANUAL`.
-- `<amount>`: positive float, in the same units as `GOTO`/`TRAJ_POINT`
-  (cm for `X`/`Y`, degrees for `A`).
-- Updates the same tracked position `GET_POSITION` reports. Unlike
-  `MANUAL`, no steps-to-units conversion is needed since the amount is
-  already given in real units.
+- `<axis>`, `<direction>`: mismo significado y codificación que
+  `MANUAL`.
+- `<amount>`: float positivo, en las mismas unidades que
+  `GOTO`/`TRAJ_POINT` (cm para `X`/`Y`, grados para `A`).
+- Actualiza la misma posición rastreada que reporta `GET_POSITION`. A
+  diferencia de `MANUAL`, no hace falta conversión de pasos a unidades
+  ya que la cantidad viene dada directamente en unidades reales.
 
-## Absolute Positioning Commands
+## Comandos de Posicionamiento Absoluto
 
-`GOTO` is only valid when the system is IDLE (not homing, not
-receiving a trajectory, not running) — same restriction as Manual
-Movement. `GET_POSITION` is a read-only query, allowed in any state
-(like `STATUS`).
+`GOTO` solo es válido cuando el sistema está IDLE (no homing, no
+recibiendo trayectoria, no corriendo) — misma restricción que
+Movimiento Manual. `GET_POSITION` es una consulta de solo lectura,
+permitida en cualquier estado (como `STATUS`).
 
-| Command | Format | Response |
+| Comando | Formato | Respuesta |
 |---|---|---|
-| Go to position | `<GOTO:x,y,angle>` | `OK` or `ERROR:<code>:<msg>` |
-| Get position | `<GET_POSITION>` | `POSITION:<x>,<y>,<angle>` |
+| Ir a posición | `<GOTO:x,y,angle>` | `OK` o `ERROR:<code>:<msg>` |
+| Obtener posición | `<GET_POSITION>` | `POSITION:<x>,<y>,<angle>` |
 
-- `<x>`, `<y>`, `<angle>`: same units and reference frame as
-  `TRAJ_POINT` below — `x`/`y` in cm, `angle` in degrees, relative to
-  the `(0, 0, 0)` reference established by the most recent successful
-  `HOME`.
-- `GOTO` moves directly to an absolute position, unlike `MANUAL`'s
-  relative, step-based movement.
-- `GET_POSITION` reports the system's current tracked position,
-  including the cumulative effect of any `MANUAL` moves performed
-  since the last `HOME` or `GOTO`. This is the only way the Raspberry
-  Pi can learn the real-unit result of a step-based manual move, since
-  it does not itself know any steps-to-units conversion — that
-  conversion is the firmware's responsibility, same as the physical
-  calibration it already performs during `HOME`.
-- The tracked position must also be updated as a trajectory executes
-  (once per `TRAJ_POINT` reached, i.e. in step with each
-  `TRAJ_PROGRESS`), not only by `MANUAL`/`GOTO` — after a `PAUSE` or
-  `ABORT`, `GET_POSITION` is the only way the Raspberry Pi knows where
-  the system actually stopped mid-trajectory, which the safe
-  repositioning sequence (see `SystemStateMachine.safe_return_to_position`
-  in system_state.py) depends on.
+- `<x>`, `<y>`, `<angle>`: mismas unidades y marco de referencia que
+  `TRAJ_POINT` abajo — `x`/`y` en cm, `angle` en grados, relativos a
+  la referencia `(0, 0, 0)` establecida por el `HOME` exitoso más
+  reciente.
+- `GOTO` se mueve directamente a una posición absoluta, a diferencia
+  del movimiento relativo y basado en pasos de `MANUAL`.
+- `GET_POSITION` reporta la posición rastreada actual del sistema,
+  incluyendo el efecto acumulado de cualquier movimiento `MANUAL`
+  realizado desde el último `HOME` o `GOTO`. Esta es la única forma en
+  que la Raspberry Pi puede conocer el resultado en unidades reales de
+  un movimiento manual basado en pasos, ya que ella misma no conoce
+  ninguna conversión de pasos a unidades — esa conversión es
+  responsabilidad del firmware, igual que la calibración física que ya
+  realiza durante `HOME`.
+- La posición rastreada también debe actualizarse a medida que se
+  ejecuta una trayectoria (una vez por cada `TRAJ_POINT` alcanzado, es
+  decir, en sincronía con cada `TRAJ_PROGRESS`), no solo por
+  `MANUAL`/`GOTO` — después de un `PAUSE` o `ABORT`, `GET_POSITION` es
+  la única forma en que la Raspberry Pi sabe dónde se detuvo realmente
+  el sistema a mitad de trayectoria, de lo cual depende la secuencia
+  de reposicionamiento seguro (ver
+  `SystemStateMachine.safe_return_to_position` en system_state.py).
 
-## Trajectory Transfer Commands
+## Comandos de Transferencia de Trayectoria
 
-A trajectory is a sequence of points, each with time, horizontal
-position, vertical position, and sagittal angle, all sharing the same
-time base (they originate from a single CSV with columns
-`time, pos_x, pos_y, angle`).
+Una trayectoria es una secuencia de puntos, cada uno con tiempo,
+posición horizontal, posición vertical, y ángulo sagital, todos
+compartiendo la misma base de tiempo (se originan de un único CSV con
+columnas `time, pos_x, pos_y, angle`).
 
-| Command | Format | Response |
+| Comando | Formato | Respuesta |
 |---|---|---|
-| Begin transfer | `<TRAJ_BEGIN:n_points>` | `TRAJ_READY` |
-| Send point | `<TRAJ_POINT:t,x,y,angle>` | `ACK:<index>` |
-| End transfer | `<TRAJ_END>` | `TRAJ_STORED` or `ERROR:<code>:<msg>` |
+| Iniciar transferencia | `<TRAJ_BEGIN:n_points>` | `TRAJ_READY` |
+| Enviar punto | `<TRAJ_POINT:t,x,y,angle>` | `ACK:<index>` |
+| Finalizar transferencia | `<TRAJ_END>` | `TRAJ_STORED` o `ERROR:<code>:<msg>` |
 
-`<n_points>` can vary between trajectories (not fixed to any specific
-count, e.g. not always ~120). The ESP32 must validate that the number
-of `TRAJ_POINT` messages received before `TRAJ_END` matches
-`<n_points>`; a mismatch results in `ERROR:POINT_COUNT_MISMATCH:...`.
+`<n_points>` puede variar entre trayectorias (no está fijo a ninguna
+cantidad específica, ej. no siempre ~120). El ESP32 debe validar que
+la cantidad de mensajes `TRAJ_POINT` recibidos antes de `TRAJ_END`
+coincida con `<n_points>`; un desajuste resulta en
+`ERROR:POINT_COUNT_MISMATCH:...`.
 
-## Execution Commands
+## Comandos de Ejecución
 
-| Command | Format | Response |
+| Comando | Formato | Respuesta |
 |---|---|---|
-| Run | `<RUN>` | `RUNNING` immediately, then one `TRAJ_PROGRESS` per point (in order) while executing, then `FINISHED` when the cycle completes |
+| Run | `<RUN>` | `RUNNING` inmediatamente, luego un `TRAJ_PROGRESS` por punto (en orden) mientras ejecuta, luego `FINISHED` cuando termina el ciclo |
 | Pause | `<PAUSE>` | `PAUSED` |
 | Resume | `<RESUME>` | `RUNNING` |
-| Abort | `<ABORT>` | `ABORTED` on success, `ERROR:INVALID_STATE:...` otherwise |
+| Abort | `<ABORT>` | `ABORTED` si tiene éxito, `ERROR:INVALID_STATE:...` en caso contrario |
 
-`ABORT` abandons a paused trajectory entirely (operator chose to restart
-the trial or run a different one instead of resuming) and returns the
-system to `IDLE`, discarding remaining trajectory progress — unlike
-`STOP`, which is a resumable pause (see System Flow below). Only valid
-while `PAUSED`; the ESP32 must reject it otherwise with
-`ERROR:INVALID_STATE:...`. The system's tracked position (`GET_POSITION`)
-must reflect wherever execution actually stopped — see the note under
-Absolute Positioning Commands.
+`ABORT` abandona por completo una trayectoria en pausa (el operador
+eligió reiniciar el ensayo o correr uno distinto en vez de reanudar) y
+devuelve el sistema a `IDLE`, descartando el progreso restante de la
+trayectoria — a diferencia de `STOP`, que es una pausa reanudable (ver
+Flujo del Sistema abajo). Solo es válido mientras está `PAUSED`; el
+ESP32 debe rechazarlo en cualquier otro caso con
+`ERROR:INVALID_STATE:...`. La posición rastreada del sistema
+(`GET_POSITION`) debe reflejar dónde se detuvo realmente la ejecución
+— ver la nota bajo Comandos de Posicionamiento Absoluto.
 
-### Execution progress (unsolicited, during RUNNING)
+### Progreso de ejecución (no solicitado, durante RUNNING)
 
-| Response | Format | Notes |
+| Respuesta | Formato | Notas |
 |---|---|---|
-| Progress | `TRAJ_PROGRESS:<t>,<x>,<y>,<angle>` | One per stored trajectory point, sent in order as each point is "executed". Not a response to any single command — arrives asynchronously while the system is RUNNING, same as `FINISHED`. |
+| Progreso | `TRAJ_PROGRESS:<t>,<x>,<y>,<angle>` | Uno por cada punto de trayectoria almacenado, enviado en orden a medida que cada punto se "ejecuta". No es respuesta a ningún comando en particular — llega de forma asíncrona mientras el sistema está en RUNNING, igual que `FINISHED`. |
 
-**Provisional**: this message and its exact pacing are defined by the test
-firmware (`firmware/gaitsim-esp32-test/main.cpp`) to support live plotting on
-the Raspberry Pi (see CLAUDE.md). The test firmware emits one `TRAJ_PROGRESS`
-every fixed 120ms per point, regardless of the point's own `t` value —
-this cadence is test-only, purely to make the live plot visible, and does
-NOT represent real execution timing. The definitive firmware (Horizon 2) will
-have its own real timing between points (unknown for now), but is expected to
-emit the same per-point structure (`t,x,y,angle`) so the Raspberry Pi side
-does not need to change when that firmware becomes available.
+**Provisional**: este mensaje y su cadencia exacta están definidos por
+el firmware de prueba (`firmware/gaitsim-esp32-test/main.cpp`) para
+soportar el graficado en vivo en la Raspberry Pi (ver CLAUDE.md). El
+firmware de prueba emite un `TRAJ_PROGRESS` cada 120ms fijos por
+punto, sin importar el valor propio de `t` del punto — esta cadencia
+es solo de prueba, únicamente para hacer visible el gráfico en vivo, y
+NO representa el timing real de ejecución. El firmware definitivo
+(Horizonte 2) tendrá su propio timing real entre puntos (desconocido
+por ahora), pero se espera que emita la misma estructura por punto
+(`t,x,y,angle`) para que el lado de la Raspberry Pi no necesite
+cambiar cuando ese firmware esté disponible.
 
-## Error Format
+## Formato de Error
 
-All errors follow the same structure, regardless of which command
-triggered them:
+Todos los errores siguen la misma estructura, sin importar qué comando
+los haya provocado:
 
 
 ERROR:<code>:<short message>
 
-Examples:
+Ejemplos:
 - `ERROR:LIMIT_REACHED:X axis`
 - `ERROR:INVALID_STATE:cannot home while running`
 - `ERROR:POINT_COUNT_MISMATCH:expected 120, got 118`
 
-Error codes are not yet formally enumerated; as new error conditions
-are identified during firmware development, they should be documented
-here.
+Los códigos de error todavía no están formalmente enumerados; a medida
+que se identifiquen nuevas condiciones de error durante el desarrollo
+del firmware, deben documentarse aquí.
 
-## System Flow (reference)
+## Flujo del Sistema (referencia)
 
-1. RPi sends `<PING>` to verify the link.
-2. RPi sends `<HOME>`. ESP32 performs homing and limit mapping, resets
-   its tracked position to `(0, 0, 0)`, then responds `READY`. This
-   happens once per power-on session.
-3. Optionally, RPi sends `<GOTO:x,y,angle>` to move to a starting
-   position before sending/running a trajectory (only while IDLE). The
-   position can be fine-tuned afterwards with `MANUAL` moves and its
-   real-unit result read back with `GET_POSITION`.
-4. For each trial:
-   - RPi sends `<TRAJ_BEGIN:n_points>`
-   - RPi sends `<TRAJ_POINT:...>` for each point
-   - RPi sends `<TRAJ_END>`
-   - RPi sends `<RUN>`
-   - ESP32 responds `RUNNING`, then `FINISHED` when done
-   - System is ready for the next trajectory without re-homing
-5. Manual movement (`<MANUAL:...>`) is only accepted when the system is
-   idle (not homing, not running).
-6. `<STOP>` acts as an immediate pause during execution; `<RESUME>`
-   continues from where it left off.
+1. La RPi envía `<PING>` para verificar el enlace.
+2. La RPi envía `<HOME>`. El ESP32 realiza el homing y el mapeo de
+   límites, reinicia su posición rastreada a `(0, 0, 0)`, y luego
+   responde `READY`. Esto ocurre una vez por sesión de encendido.
+3. Opcionalmente, la RPi envía `<GOTO:x,y,angle>` para moverse a una
+   posición inicial antes de enviar/correr una trayectoria (solo
+   mientras está IDLE). La posición se puede ajustar finamente después
+   con movimientos `MANUAL` y su resultado en unidades reales se puede
+   leer de vuelta con `GET_POSITION`.
+4. Para cada ensayo:
+   - La RPi envía `<TRAJ_BEGIN:n_points>`
+   - La RPi envía `<TRAJ_POINT:...>` por cada punto
+   - La RPi envía `<TRAJ_END>`
+   - La RPi envía `<RUN>`
+   - El ESP32 responde `RUNNING`, luego `FINISHED` cuando termina
+   - El sistema queda listo para la siguiente trayectoria sin
+     necesidad de rehacer el homing
+5. El movimiento manual (`<MANUAL:...>`) solo se acepta cuando el
+   sistema está idle (no homing, no running).
+6. `<STOP>` actúa como una pausa inmediata durante la ejecución;
+   `<RESUME>` continúa desde donde quedó.
 
-## Design Notes
+## Notas de Diseño
 
-- Plain text was chosen over binary for readability during
-  development/debugging and because trajectory payloads are small
-  (tens to low hundreds of points per trial).
-- Consolidating `x`, `y`, `angle` into a single `TRAJ_POINT` message
-  (instead of three separate per-axis transfers) was a deliberate
-  choice: all three axes share the same time base within one gait
-  cycle, so sending them together avoids the need for the firmware to
-  synchronize three independent arrays.
+- Se eligió texto plano en vez de binario por legibilidad durante el
+  desarrollo/depuración y porque los payloads de trayectoria son
+  pequeños (decenas a algunos cientos de puntos por ensayo).
+- Consolidar `x`, `y`, `angle` en un único mensaje `TRAJ_POINT` (en vez
+  de tres transferencias separadas por eje) fue una decisión
+  deliberada: los tres ejes comparten la misma base de tiempo dentro
+  de un ciclo de marcha, así que enviarlos juntos evita que el
+  firmware tenga que sincronizar tres arreglos independientes.
