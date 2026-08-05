@@ -39,12 +39,11 @@ CMD_HOME = "HOME"
 CMD_STATUS = "STATUS"
 
 CMD_MANUAL = "MANUAL"        # MANUAL:<axis>:<direction>:<steps>
-CMD_MOVE_REL = "MOVE_REL"    # MOVE_REL:<axis>:<direction>:<amount>
 CMD_STOP = "STOP"
 
-# Wire encoding for the `direction` field of MANUAL/MOVE_REL: everything
+# Wire encoding for the `direction` field of MANUAL: everything
 # past a command's first argument must be an integer (see docs/protocol.md,
-# Manual/Relative Movement Commands) — `axis` stays a letter (the allowed
+# Manual Movement Commands) — `axis` stays a letter (the allowed
 # first argument), so `direction` maps "+"/"-" to 1/0, matching the DIR
 # pin-level convention already used by the definitive ESP32 firmware
 # (X_POSITIVE_DIR = 1, etc.) for consistency between the two protocols.
@@ -229,28 +228,6 @@ def build_manual_move(axis: str, direction: str, steps: int) -> str:
     if steps <= 0:
         raise ValueError(f"Steps must be a positive integer, got {steps}.")
     return f"<{CMD_MANUAL}:{axis}:{_DIRECTION_WIRE_CODE[direction]}:{steps}>"
-
-
-def build_move_relative(axis: str, direction: str, amount: float) -> str:
-    """
-    Build a MOVE_REL command line: a relative move by a known amount in
-    real units (cm for X/Y, degrees for A) — the unit-aware counterpart
-    to build_manual_move(), which operates in raw motor steps instead.
-
-    Raises:
-        ValueError: If axis or direction are not among the allowed values,
-                    or if amount is not positive. Validating here, at the
-                    protocol boundary, prevents malformed commands from
-                    ever reaching the serial link.
-    """
-    valid_axes = ("X", "Y", "A")
-    if axis not in valid_axes:
-        raise ValueError(f"Invalid axis '{axis}'. Must be one of {valid_axes}.")
-    if direction not in ("+", "-"):
-        raise ValueError(f"Invalid direction '{direction}'. Must be '+' or '-'.")
-    if amount <= 0:
-        raise ValueError(f"Amount must be positive, got {amount}.")
-    return f"<{CMD_MOVE_REL}:{axis}:{_DIRECTION_WIRE_CODE[direction]}:{amount:.4f}>"
 
 
 def build_stop() -> str:

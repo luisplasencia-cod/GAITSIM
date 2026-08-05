@@ -310,13 +310,19 @@ RESOLVED 2026-07-20 (later still), after Luis's next test round:
   offscreen screenshot (confirmed working, unlike Qt3D which could
   never be screenshotted) — this WILL render on real hardware. Nav
   button relabeled "Monitor Posición" (no longer literal 3D).
-Still outstanding for next session: (1) Luis needs to verify his
-PlatformIO build actually uses this repo's main.cpp, reflash, and
-confirm ABORT works; (2) verify the corrected retry/calibration-lock
-behavior and the new Monitor Posición window on real hardware.
+RESOLVED 2026-07-31: both outstanding items above confirmed on real
+hardware — Luis reflashed with a PlatformIO build matching this repo's
+main.cpp and ABORT no longer errors with UNKNOWN_COMMAND; the
+corrected retry/calibration-lock behavior and the Monitor Posición
+window were also confirmed with no visual problems. This was given as
+one broad confirmation covering the whole feature set built since
+2026-07-19 together (see the 2026-07-31 status block at the end of
+this section for what that does and doesn't cover, and for several
+features built 2026-07-22 through 2026-07-25 not otherwise narrated
+in this file).
 
 Open question for next session: what specific functionality comes next
-after this is verified — Luis's direction, not assumption.
+— Luis's direction, not assumption.
 
 Consider addressing the git corruption issue (see below) before it causes
 real data loss.
@@ -386,11 +392,52 @@ up with the right position and the guard flag correctly ignores an
 unrelated `trajectory_finished`; out-of-range target confirmed to be
 rejected with NO wire traffic; `CalibrationMapWindow` with a live
 marker rendered via an offscreen screenshot without crashing (marker
-position/orientation visually correct). NOT yet run against real
-hardware — same Confirmation protocol rule applies: don't mark this
-done until verified on the Raspberry Pi + test ESP32 (calibrate ->
-enter initial point -> watch the marker move in the calibration map ->
-confirm all 3 axes arrive together).
+position/orientation visually correct).
+
+Also implemented 2026-07-22 through 2026-07-25 (full detail in the
+project's memory files, not re-narrated here): the `<HOME>` calibration
+sweep now maps the available movement space per axis
+(`CalibrationMapWindow`/`CalibrationMapView`, angular axis reinterpreted
+relative to horizontal via `ANGLE_HORIZONTAL_OFFSET_DEG`); a central
+`src/utils/trajectory_validator.py` rejects any out-of-range move/
+trajectory before it reaches the ESP32, surfaced via a new
+`LimitViolationDialog` and a fixed-height "Estado del Sistema" box;
+the live trajectory plot no longer mixes in manual/return/abort
+movement (`_plot_active` gating in `trajectory_screen.py`), and `Run`
+now stays blocked until a fresh CSV is loaded for the current initial
+position; `monitor_3d_window.py` was renamed `platform_view.py` and
+folded into `TrajectoryScreen` alongside Trayectorias and the Live
+Plot (Monitor Posición is no longer a separate window); and a bug
+where a loaded ensayo's `Run` jumped the angle to an absolute CSV
+value instead of starting from the rig's current angle was fixed in
+`TrajectoryScreen._offset_points`.
+
+**Status as of 2026-07-31**: Luis confirmed real-hardware verification
+(real Raspberry Pi + real test ESP32) of the whole feature set above —
+calibration mapping, boundary validation, plot isolation/fresh-CSV
+gating, the consolidated TrajectoryScreen layout, the angle-offset fix,
+and the synchronized initial-position trajectory (including the
+marker-tracking check called out above) — no visual problems reported.
+Given as one broad confirmation, not itemized per sub-behavior; if a
+specific edge case one of these features was built to fix resurfaces
+(e.g. an asymmetric calibration range, a CSV whose first angle differs
+from the current one, real-finger ergonomics on the 28px `SLIM`
+buttons), treat it as not actually covered here rather than a
+regression. Horizon 2 remains not started — this confirmation is
+scoped to the RPi app + test firmware only.
+
+Also done same day: removed the `MOVE_REL` wire command (real-unit
+relative move) as dead code — `SystemStateMachine.move_relative()`
+already stopped calling it in favor of a generated single-axis
+trajectory (see 2026-07-23 entry above), so the manual-jog buttons were
+unaffected; removed from `docs/protocol.md`, `protocol.py`,
+`esp32_controller.py`, and the test firmware. And changed
+`ConnectionScreen`'s "Ir a Posición Inicial" (both the
+`safe_return_to_position` and synchronized-trajectory branches) to
+navigate to the monitor screen as soon as the move starts rather than
+once it finishes, so its live position polling is visible for the
+whole move. Both changes confirmed on real hardware same day, no
+problems reported.
 
 ## Deferred / not built yet (do not build unless explicitly asked)
 GUI polish (splash screen, branding), user management, pathology

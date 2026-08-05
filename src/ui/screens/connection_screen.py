@@ -134,12 +134,15 @@ class ConnectionScreen(QWidget):
                 module docstring).
     """
 
-    # Emitted once "Ir a Posición Inicial" actually produces a real
+    # Emitted as soon as "Ir a Posición Inicial" actually starts a real
     # movement (not on a rejected/out-of-range attempt, and not on the
-    # no-op case where the target is already the current position) —
-    # main_window.py connects this to switching to the Monitor screen
-    # (2026-07-26+, Luis's explicit request), same cross-screen-
-    # navigation pattern as TrajectoryScreen.request_new_trial.
+    # no-op case where the target is already the current position) — NOT
+    # once it finishes, so the Monitor screen's live position polling is
+    # visible for the whole move instead of only after there's nothing
+    # left to watch. main_window.py connects this to switching to the
+    # Monitor screen (2026-07-26+, Luis's explicit request; navigate-at-
+    # start behavior since 2026-07-31), same cross-screen-navigation
+    # pattern as TrajectoryScreen.request_new_trial.
     request_show_monitor = Signal()
 
     def __init__(
@@ -477,15 +480,18 @@ class ConnectionScreen(QWidget):
                         f"No se puede establecer esa posición inicial: {exc}"
                     ) from exc
 
-            def on_success():
-                self._on_goto_succeeded(position)
-                self.request_show_monitor.emit()
-
             self._run_action(
                 action_fn,
                 success_message=f"En posición inicial: X={x:g} cm, Y={y:g} cm, Á={angle:g}°.",
-                on_success=on_success,
+                on_success=lambda: self._on_goto_succeeded(position),
             )
+            # Switch to the monitor screen as soon as the move is under
+            # way (not once it completes) — that screen's position
+            # polling is what actually shows safe_return_to_position()'s
+            # multi-step sequence happening live; waiting for on_success
+            # here would mean navigating there only after there's
+            # nothing left to watch.
+            self.request_show_monitor.emit()
         else:
             self._on_goto_initial_synchronized(position)
 
@@ -544,6 +550,12 @@ class ConnectionScreen(QWidget):
         self._run_action(
             send_and_run,
             success_message="Moviendo a la posición inicial (trayectoria sincronizada)...",
+            # Fires once RUN is confirmed (RUNNING), not once the move
+            # finishes — navigate to the monitor screen right as the
+            # movement starts so its live TRAJ_PROGRESS marker is
+            # visible for the whole trip, same reasoning as the
+            # safe_return_to_position branch above.
+            on_success=lambda: self.request_show_monitor.emit(),
         )
 
     def _on_goto_succeeded(self, position: Position):
@@ -623,8 +635,10 @@ class ConnectionScreen(QWidget):
             f"En posición inicial: X={position.x:g} cm, Y={position.y:g} cm, "
             f"Á={position.angle:g}°."
         )
+        # Navigation already happened in _on_goto_initial_synchronized's
+        # on_success (right as RUN was confirmed) — this only records the
+        # final position now that the move has actually completed.
         self._on_goto_succeeded(position)
-        self.request_show_monitor.emit()
 
     def _refresh_controls(self):
         """Enable/disable buttons based on what the state machine

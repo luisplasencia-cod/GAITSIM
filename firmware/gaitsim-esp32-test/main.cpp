@@ -144,7 +144,7 @@ const unsigned long CAL_PROGRESS_INTERVAL_MS = 200;
 // Runs one axis's MIN -> travel -> MAX sequence.
 //   limLabel: the LIM{...} token infix, e.g. "Y", "X", "ANG"
 //   axisCode: the axis letter used in CAL_PROGRESS payloads (matches
-//             MANUAL/MOVE_REL/GOTO's axis convention: X, Y, A)
+//             MANUAL/GOTO's axis convention: X, Y, A)
 //   maxValue: full simulated travel for this axis (cm or deg)
 //
 // Unlike every other outgoing response in this file, these calibration
@@ -230,42 +230,6 @@ void handleManual(const String &line) {
   }
   // Simulated: no real limit checking yet.
   float delta = steps * TEST_UNITS_PER_STEP * (direction == 1 ? 1.0 : -1.0);
-  if (axis == "X") posX += delta;
-  else if (axis == "Y") posY += delta;
-  else if (axis == "A") posAngle += delta;
-
-  sendResponse("OK");
-}
-
-void handleMoveRel(const String &line) {
-  if (currentState != STATE_IDLE) {
-    sendError("INVALID_STATE", "move not allowed in current state");
-    return;
-  }
-  // Format: MOVE_REL:<axis>:<direction>:<amount> — direction is an
-  // integer on the wire (1 = "+", 0 = "-"), same convention as MANUAL.
-  String parts[4];
-  int n = splitCommand(line, parts, 4);
-  if (n != 4) {
-    sendError("MALFORMED", "expected MOVE_REL:<axis>:<direction>:<amount>");
-    return;
-  }
-  String axis = parts[1];
-  int direction = parts[2].toInt();
-  float amount = parts[3].toFloat();
-
-  if (axis != "X" && axis != "Y" && axis != "A") {
-    sendError("INVALID_AXIS", axis);
-    return;
-  }
-  if (direction != 1 && direction != 0) {
-    sendError("INVALID_DIRECTION", String(direction));
-    return;
-  }
-
-  // Already in real units, so no TEST_UNITS_PER_STEP conversion needed
-  // here (unlike handleManual()).
-  float delta = amount * (direction == 1 ? 1.0 : -1.0);
   if (axis == "X") posX += delta;
   else if (axis == "Y") posY += delta;
   else if (axis == "A") posAngle += delta;
@@ -504,7 +468,6 @@ void processLine(const String &line) {
   else if (line.startsWith("ABORT")) handleAbort();
   else if (line.startsWith("GOTO")) handleGoTo(line);
   else if (line.startsWith("GET_POSITION")) handleGetPosition();
-  else if (line.startsWith("MOVE_REL")) handleMoveRel(line);
   else sendError("UNKNOWN_COMMAND", line);
 }
 

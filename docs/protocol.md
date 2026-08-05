@@ -27,7 +27,7 @@ funcione sin modificaciones.
   después del primero debe ser numérico — entero, o (como en
   `TRAJ_POINT`/`GOTO`, donde todos los argumentos ya son numéricos) un
   float. Ningún comando puede llevar un segundo argumento textual/
-  categórico — ej. el `direction` de `MANUAL`/`MOVE_REL` es un entero
+  categórico — ej. el `direction` de `MANUAL` es un entero
   (`1`/`0`), no texto `+`/`-`, precisamente para que no sea un segundo
   argumento de tipo string. Esto coincide con la función genérica de
   recepción del lado ESP32, que parsea el argumento 0 como string y
@@ -72,7 +72,7 @@ ESP32 -> RPi (que es texto plano sin marco, ver Transporte), estos
 eventos de calibración SÍ están envueltos en `<` `>`, y los dos
 argumentos de `CAL_PROGRESS` siguen la misma forma string-primero/
 numérico-el-resto, separada por dos puntos, que los comandos RPi ->
-ESP32 con múltiples argumentos como `MANUAL`/`MOVE_REL` — por pedido
+ESP32 con múltiples argumentos como `MANUAL` — por pedido
 explícito, para que esta convención de argumentos se aplique de forma
 uniforme sin importar la dirección. Esto deliberadamente NO se aplica
 retroactivamente a respuestas existentes (`READY`, `TRAJ_PROGRESS`,
@@ -145,26 +145,6 @@ una trayectoria.
 - `<direction>`: entero, `1` = `+`, `0` = `-` (ver la nota de
   Transporte sobre tipos de argumento arriba)
 - `<steps>`: entero positivo
-
-## Comandos de Movimiento Relativo (unidades reales)
-
-Una alternativa a `MANUAL` para quien quiera moverse una cantidad real
-conocida (cm/grados) en vez de pasos crudos de motor — usado por los
-botones de ajuste manual de la Raspberry Pi una vez que existe una
-posición de referencia (después de `HOME` y/o `GOTO`). Solo válido
-cuando el sistema está IDLE, misma restricción que `MANUAL`.
-
-| Comando | Formato | Respuesta |
-|---|---|---|
-| Movimiento relativo | `<MOVE_REL:axis:direction:amount>` | `OK` o `ERROR:<code>:<msg>` |
-
-- `<axis>`, `<direction>`: mismo significado y codificación que
-  `MANUAL`.
-- `<amount>`: float positivo, en las mismas unidades que
-  `GOTO`/`TRAJ_POINT` (cm para `X`/`Y`, grados para `A`).
-- Actualiza la misma posición rastreada que reporta `GET_POSITION`. A
-  diferencia de `MANUAL`, no hace falta conversión de pasos a unidades
-  ya que la cantidad viene dada directamente en unidades reales.
 
 ## Comandos de Posicionamiento Absoluto
 

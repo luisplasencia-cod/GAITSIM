@@ -192,23 +192,6 @@ class ESP32Controller:
         message = protocol.build_manual_move(axis, direction, steps)
         self._send_and_wait(message, expected_kinds=["OK"], timeout=timeout)
 
-    def move_relative(
-        self, axis: str, direction: str, amount: float, timeout: float = DEFAULT_TIMEOUT
-    ) -> None:
-        """
-        Move a single axis by a relative amount in real units (cm for
-        X/Y, degrees for A) — the unit-aware counterpart to
-        move_manual(), which operates in raw motor steps. Only valid
-        while idle.
-
-        Raises:
-            DeviceReportedError: If the move is rejected (e.g. wrong
-                state, limit reached).
-            TimeoutWaitingForResponseError: If no response arrives.
-        """
-        message = protocol.build_move_relative(axis, direction, amount)
-        self._send_and_wait(message, expected_kinds=["OK"], timeout=timeout)
-
     def stop(self, timeout: float = DEFAULT_TIMEOUT) -> None:
         """Immediately stop/pause motion (acts as an emergency stop)."""
         self._send_and_wait(

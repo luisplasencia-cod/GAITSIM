@@ -157,10 +157,11 @@ class MainWindow(QMainWindow):
 
     def _show_monitor_screen(self):
         """
-        Triggered by ConnectionScreen.request_show_monitor, once "Ir a
-        Posición Inicial" actually produces a real movement — see that
-        signal's docstring for which cases count. Same nav-bar-checked-
-        state bookkeeping as _show_connection_screen, mirrored.
+        Triggered by ConnectionScreen.request_show_monitor, as soon as
+        "Ir a Posición Inicial" starts a real movement (not once it
+        finishes) — see that signal's docstring for which cases count.
+        Same nav-bar-checked-state bookkeeping as _show_connection_screen,
+        mirrored.
         """
         self._stack.setCurrentIndex(1)
         self._trajectory_nav_btn.setChecked(True)
