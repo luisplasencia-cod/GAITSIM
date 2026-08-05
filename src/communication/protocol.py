@@ -50,7 +50,7 @@ CMD_STOP = "STOP"
 _DIRECTION_WIRE_CODE = {"+": 1, "-": 0}
 
 CMD_TRAJ_BEGIN = "TRAJ_BEGIN"   # TRAJ_BEGIN:<n_points>
-CMD_TRAJ_POINT = "TRAJ_POINT"   # TRAJ_POINT:<t>,<x>,<y>,<angle>
+CMD_TRAJ_POINT = "TRAJ_POINT"   # TRAJ_POINT:<t>:<x>:<y>:<angle>
 CMD_TRAJ_END = "TRAJ_END"
 
 CMD_RUN = "RUN"
@@ -58,7 +58,7 @@ CMD_PAUSE = "PAUSE"
 CMD_RESUME = "RESUME"
 CMD_ABORT = "ABORT"     # abandon a PAUSED trajectory entirely -> IDLE
 
-CMD_GOTO = "GOTO"                   # GOTO:<x>,<y>,<angle>
+CMD_GOTO = "GOTO"                   # GOTO:<x>:<y>:<angle>
 CMD_GET_POSITION = "GET_POSITION"
 
 
@@ -259,7 +259,7 @@ def build_trajectory_point(point: TrajectoryPoint) -> str:
     """
     return (
         f"<{CMD_TRAJ_POINT}:"
-        f"{point.t:.4f},{point.x:.4f},{point.y:.4f},{point.angle:.4f}>"
+        f"{point.t:.4f}:{point.x:.4f}:{point.y:.4f}:{point.angle:.4f}>"
     )
 
 
@@ -300,7 +300,7 @@ def build_goto_position(position: Position) -> str:
     """
     return (
         f"<{CMD_GOTO}:"
-        f"{position.x:.4f},{position.y:.4f},{position.angle:.4f}>"
+        f"{position.x:.4f}:{position.y:.4f}:{position.angle:.4f}>"
     )
 
 
@@ -411,30 +411,30 @@ def parse_response(line: str) -> ParsedResponse:
 
 def parse_trajectory_progress(payload: str) -> TrajectoryPoint:
     """
-    Parse the payload of a TRAJ_PROGRESS response ("<t>,<x>,<y>,<angle>")
+    Parse the payload of a TRAJ_PROGRESS response ("<t>:<x>:<y>:<angle>")
     into a TrajectoryPoint.
 
     Args:
         payload: The ParsedResponse.payload of a "TRAJ_PROGRESS" response.
 
     Raises:
-        ValueError: If the payload does not contain exactly 4 comma-
+        ValueError: If the payload does not contain exactly 4 colon-
             separated numeric fields.
     """
-    t, x, y, angle = payload.split(",")
+    t, x, y, angle = payload.split(":")
     return TrajectoryPoint(t=float(t), x=float(x), y=float(y), angle=float(angle))
 
 
 def parse_position(payload: str) -> Position:
     """
-    Parse the payload of a POSITION response ("<x>,<y>,<angle>") into a
+    Parse the payload of a POSITION response ("<x>:<y>:<angle>") into a
     Position.
 
     Raises:
-        ValueError: If the payload does not contain exactly 3 comma-
+        ValueError: If the payload does not contain exactly 3 colon-
             separated numeric fields.
     """
-    x, y, angle = payload.split(",")
+    x, y, angle = payload.split(":")
     return Position(x=float(x), y=float(y), angle=float(angle))
 
 

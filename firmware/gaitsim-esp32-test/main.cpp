@@ -242,14 +242,14 @@ void handleGoTo(const String &line) {
     sendError("INVALID_STATE", "goto not allowed in current state");
     return;
   }
-  // Format: GOTO:<x>,<y>,<angle>
+  // Format: GOTO:<x>:<y>:<angle>
   int colonIdx = line.indexOf(':');
   String data = line.substring(colonIdx + 1);
 
-  int c1 = data.indexOf(',');
-  int c2 = data.indexOf(',', c1 + 1);
+  int c1 = data.indexOf(':');
+  int c2 = data.indexOf(':', c1 + 1);
   if (c1 == -1 || c2 == -1) {
-    sendError("MALFORMED", "expected GOTO:<x>,<y>,<angle>");
+    sendError("MALFORMED", "expected GOTO:<x>:<y>:<angle>");
     return;
   }
 
@@ -262,8 +262,8 @@ void handleGoTo(const String &line) {
 }
 
 void handleGetPosition() {
-  sendResponse("POSITION:" + String(posX, 4) + "," + String(posY, 4) +
-               "," + String(posAngle, 4));
+  sendResponse("POSITION:" + String(posX, 4) + ":" + String(posY, 4) +
+               ":" + String(posAngle, 4));
 }
 
 void handleStop() {
@@ -305,15 +305,15 @@ void handleTrajPoint(const String &line) {
     sendError("POINT_COUNT_MISMATCH", "received more points than announced");
     return;
   }
-  // Format: TRAJ_POINT:<t>,<x>,<y>,<angle>
+  // Format: TRAJ_POINT:<t>:<x>:<y>:<angle>
   int colonIdx = line.indexOf(':');
   String data = line.substring(colonIdx + 1);
 
-  int c1 = data.indexOf(',');
-  int c2 = data.indexOf(',', c1 + 1);
-  int c3 = data.indexOf(',', c2 + 1);
+  int c1 = data.indexOf(':');
+  int c2 = data.indexOf(':', c1 + 1);
+  int c3 = data.indexOf(':', c2 + 1);
   if (c1 == -1 || c2 == -1 || c3 == -1) {
-    sendError("MALFORMED", "expected TRAJ_POINT:<t>,<x>,<y>,<angle>");
+    sendError("MALFORMED", "expected TRAJ_POINT:<t>:<x>:<y>:<angle>");
     return;
   }
 
@@ -394,8 +394,8 @@ void handleRun() {
     posX = pt.x;
     posY = pt.y;
     posAngle = pt.angle;
-    sendResponse("TRAJ_PROGRESS:" + String(pt.t, 4) + "," + String(pt.x, 4) +
-                 "," + String(pt.y, 4) + "," + String(pt.angle, 4));
+    sendResponse("TRAJ_PROGRESS:" + String(pt.t, 4) + ":" + String(pt.x, 4) +
+                 ":" + String(pt.y, 4) + ":" + String(pt.angle, 4));
 
     // Wait ~120ms before the next point (TEST-ONLY cadence), polling
     // throughout so a PAUSE/STOP arriving mid-wait is noticed promptly

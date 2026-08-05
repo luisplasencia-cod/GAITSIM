@@ -22,6 +22,10 @@ funcione sin modificaciones.
 - **Respuestas ESP32 -> RPi**: no afectadas por lo anterior — texto
   ASCII plano, una respuesta por línea, terminada en `\n`, exactamente
   como se muestra en las celdas `Response`/`Format` de abajo.
+- **Separador de argumentos**: `:` (dos puntos) en todos los mensajes
+  con 2+ argumentos, sin excepción — misma dirección (RPi -> ESP32) o
+  contraria (ver la excepción de enmarcado de `CAL_PROGRESS` abajo).
+  Ningún formato usa `,` como separador.
 - **Tipos de argumento (comandos RPi -> ESP32 con 2+ argumentos)**: el
   primer argumento puede ser un string (ej. `axis`); todo argumento
   después del primero debe ser numérico — entero, o (como en
@@ -155,8 +159,8 @@ permitida en cualquier estado (como `STATUS`).
 
 | Comando | Formato | Respuesta |
 |---|---|---|
-| Ir a posición | `<GOTO:x,y,angle>` | `OK` o `ERROR:<code>:<msg>` |
-| Obtener posición | `<GET_POSITION>` | `POSITION:<x>,<y>,<angle>` |
+| Ir a posición | `<GOTO:x:y:angle>` | `OK` o `ERROR:<code>:<msg>` |
+| Obtener posición | `<GET_POSITION>` | `POSITION:<x>:<y>:<angle>` |
 
 - `<x>`, `<y>`, `<angle>`: mismas unidades y marco de referencia que
   `TRAJ_POINT` abajo — `x`/`y` en cm, `angle` en grados, relativos a
@@ -191,7 +195,7 @@ columnas `time, pos_x, pos_y, angle`).
 | Comando | Formato | Respuesta |
 |---|---|---|
 | Iniciar transferencia | `<TRAJ_BEGIN:n_points>` | `TRAJ_READY` |
-| Enviar punto | `<TRAJ_POINT:t,x,y,angle>` | `ACK:<index>` |
+| Enviar punto | `<TRAJ_POINT:t:x:y:angle>` | `ACK:<index>` |
 | Finalizar transferencia | `<TRAJ_END>` | `TRAJ_STORED` o `ERROR:<code>:<msg>` |
 
 `<n_points>` puede variar entre trayectorias (no está fijo a ninguna
@@ -223,7 +227,7 @@ ESP32 debe rechazarlo en cualquier otro caso con
 
 | Respuesta | Formato | Notas |
 |---|---|---|
-| Progreso | `TRAJ_PROGRESS:<t>,<x>,<y>,<angle>` | Uno por cada punto de trayectoria almacenado, enviado en orden a medida que cada punto se "ejecuta". No es respuesta a ningún comando en particular — llega de forma asíncrona mientras el sistema está en RUNNING, igual que `FINISHED`. |
+| Progreso | `TRAJ_PROGRESS:<t>:<x>:<y>:<angle>` | Uno por cada punto de trayectoria almacenado, enviado en orden a medida que cada punto se "ejecuta". No es respuesta a ningún comando en particular — llega de forma asíncrona mientras el sistema está en RUNNING, igual que `FINISHED`. |
 
 **Provisional**: este mensaje y su cadencia exacta están definidos por
 el firmware de prueba (`firmware/gaitsim-esp32-test/main.cpp`) para
@@ -260,7 +264,7 @@ del firmware, deben documentarse aquí.
 2. La RPi envía `<HOME>`. El ESP32 realiza el homing y el mapeo de
    límites, reinicia su posición rastreada a `(0, 0, 0)`, y luego
    responde `READY`. Esto ocurre una vez por sesión de encendido.
-3. Opcionalmente, la RPi envía `<GOTO:x,y,angle>` para moverse a una
+3. Opcionalmente, la RPi envía `<GOTO:x:y:angle>` para moverse a una
    posición inicial antes de enviar/correr una trayectoria (solo
    mientras está IDLE). La posición se puede ajustar finamente después
    con movimientos `MANUAL` y su resultado en unidades reales se puede
