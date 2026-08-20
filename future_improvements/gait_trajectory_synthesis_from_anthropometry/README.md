@@ -3,11 +3,10 @@
 **Estado**: diseño + prototipo Fase 1 (`prototype.py`) escritos y
 corriendo standalone. NO integrado a la app, NO probado contra un
 paciente/sujeto real, NO tocado nada de `src/`. Esto es investigación +
-código exploratorio, no una feature lista para usar. Retomado
-2026-08-19 para avanzar a Fase 2 (ver sección 2.5) — investigación de
-qué dataset real usar hecha, pipeline diseñado (sección 3), **pendiente
-de que Luis elija el dataset (pregunta abierta #9) antes de escribir
-código de Fase 2**.
+código exploratorio, no una feature lista para usar. **Fase 2 (dataset
+real + GPR/Fourier) PAUSADA** — en espera de integración con la parte
+del compañero (Horizonte 2), por decisión explícita de Luis
+(2026-08-19). No retomar sin instrucción explícita.
 
 **Origen**: idea de Luis (2026-07-31) — dejar de depender de que un CSV
 de trayectoria sea capturado/grabado externamente (mocap u otro medio)
@@ -219,60 +218,6 @@ transtibial y resistencia muscular/control de socket.
 - [GaitRec dataset](https://www.nature.com/articles/s41597-020-0481-z)
 - [OpenSim](https://opensim.stanford.edu/) / [opensim-core (1089★)](https://github.com/opensim-org/opensim-core)
 
-### 2.5 Retomando para Fase 2 (investigación 2026-08-19): qué dataset real usar
-
-Luis pidió retomar esto y avanzar a la Fase 2 (GPR + Fourier, sección
-2.2), validada contra una "base de datos válida" en vez de un solo CSV.
-Antes de diseñar el pipeline, verifiqué qué contiene realmente cada
-dataset candidato — la sección 2.1 había asumido que GaitRec incluía
-curvas cinemáticas (ángulos articulares); **eso resultó ser incorrecto,
-corregido aquí**:
-
-- **GaitRec (www.nature.com/articles/s41597-020-0481-z) — NO sirve para
-  esto.** Verificado: son 2,084 pacientes + 211 controles, pero el
-  dataset son **fuerzas de reacción del suelo (GRF) 3D + centro de
-  presión**, no ángulos articulares ni trayectorias cinemáticas. Tiene
-  metadata antropométrica y de patología rica, pero no la curva
-  (t, ángulo) que este proyecto necesita como variable objetivo del
-  GPR. Se mantiene como referencia de qué NO usar, no como fuente.
-- **Candidatos que sí traen cinemática + antropometría** (ninguno es
-  específico de amputados/prótesis — ver limitación abajo):
-  - Moreira/Figueiredo et al., *Lower limb kinematic, kinetic, and EMG
-    data from young healthy humans during walking at controlled speeds*
-    (Sci Data 2021, nature.com/articles/s41597-021-00881-3) — 16
-    sujetos, 7 velocidades controladas (1.0-4.0 km/h), ángulos
-    articulares normalizados al ciclo de marcha YA calculados
-    (no solo marcadores crudos), antropometría (altura 1.51-1.83m, masa
-    52.0-83.7kg) por sujeto. Pequeño pero limpio y directamente
-    utilizable — buen punto de partida para un prototipo end-to-end.
-  - Camargo et al., *A Biomechanical Dataset of 1,798 Healthy and
-    Injured Subjects During Treadmill Walking and Running* (Sci Data
-    2024, nature.com/articles/s41597-024-04011-7) — mucho más grande,
-    incluye sujetos con lesión, metadata antropométrica por sujeto en
-    CSV. Mejor candidato si Fase 2 necesita más variedad/tamaño para
-    que el GPR generalice, a costa de mayor esfuerzo de limpieza.
-  - UCI *Multivariate Gait Data*
-    (archive.ics.uci.edu/dataset/760/multivariate+gait+data) — 10
-    sujetos, ángulos de tobillo/rodilla/cadera ya normalizados a 0-100%
-    del ciclo. El más simple de parsear (formato tabular directo), pero
-    sin antropometría por sujeto más allá de lo mínimo — insuficiente
-    por sí solo para entrenar el mapeo antropometría→Fourier del paper
-    de referencia.
-  - El paper de referencia (sección 2.2) en sí NO usa ninguno de estos
-    — captura su propio mocap IMU + OpenSim, algo fuera de alcance para
-    este proyecto (sin lab de mocap propio).
-
-**Limitación importante que ningún dataset público resuelve**: todos
-son de sujetos sanos (tobillo/rodilla/cadera intactos), no del punto de
-montaje protésico transtibial que sección 2.4 estableció como lo que
-realmente representan X/Y/ángulo aquí. Esto significa que Fase 2 solo
-puede reemplazar razonablemente el paso **1a** (patrón general de
-marcha por tamaño corporal, sección 3 más abajo) con un GPR entrenado
-en datos de sujetos sanos — el paso **1b** (desplazamiento por nivel de
-amputación, cinemática de cuerpo rígido) sigue siendo el único
-mecanismo disponible para la parte específica de prótesis, y no se
-reemplaza por ningún dataset encontrado. Ver pregunta abierta #8.
-
 ## 3. Diseño propuesto (por fases)
 
 ### Fase 0 — Definir qué representa físicamente cada eje (RESUELTA 2026-07-31)
@@ -330,35 +275,16 @@ amputación (1b, es un offset en cm absolutos sobre el segmento, no algo
 que deba normalizarse por tamaño corporal — son dos propiedades físicas
 distintas del paciente, no la misma cosa medida dos veces).
 
-### Fase 2 — Refinamiento con más datos (investigación hecha 2026-08-19, diseño detallado pendiente de que Luis elija dataset — ver Pregunta abierta #9)
-Reemplazar SOLO el paso 1a (escalamiento lineal por tamaño corporal) —
-no el 1b, ver sección 2.5 — por el enfoque GPR + coeficientes de
-Fourier de la sección 2.2, entrenado contra uno de los datasets reales
-identificados en 2.5 (Moreira/Figueiredo 16 sujetos como punto de
-partida más simple, o Camargo 1,798 sujetos si se necesita más
-variedad). Pipeline propuesto:
-1. Descargar y parsear el dataset elegido a `(t_normalizado, ángulo,
-   antropometría_por_sujeto)`.
-2. Ajustar coeficientes de Fourier a la curva de cada sujeto (mismo
-   método que el paper: pocos armónicos, ~5-10 coeficientes capturan
-   una curva de marcha suave).
-3. Entrenar un GPR por coeficiente: antropometría del sujeto → ese
-   coeficiente (usando p.ej. `scikit-learn`'s `GaussianProcessRegressor`,
-   ya que el proyecto es Python).
-4. Para un paciente nuevo: predecir coeficientes vía GPR → reconstruir
-   curva de ángulo(t) vía Fourier inverso → alimentar como la nueva
-   "curva de referencia escalada" que Fase 1 paso 1b ya sabe consumir
-   (mismo punto de entrada, `apply_residual_limb_offset()` no cambia).
-5. Validación: leave-one-subject-out sobre el dataset elegido (predecir
-   cada sujeto sin usarlo en el entrenamiento, comparar RMSE contra su
-   curva real) — mismo tipo de métrica que reporta el paper de
-   referencia (1.82°-1.89° RMSE), para tener un número comparable.
-
-Esto SIGUE sin resolver que ningún dataset público tiene el punto de
-montaje protésico real (sección 2.5) — Fase 2 mejora el modelado del
-"patrón general de marcha" (1a), no reemplaza el offset por nivel de
-amputación (1b), que sigue dependiendo de `balanceo_v4.csv` + las
-preguntas abiertas #2 y #4 sin resolver.
+### Fase 2 — Refinamiento con más datos (PAUSADA — no iniciar sin instrucción explícita de Luis, ver Pregunta abierta #9)
+Idea general (sin diseño detallado todavía — pausada antes de llegar a
+ese punto): reemplazar SOLO el paso 1a (escalamiento lineal por tamaño
+corporal) — no el 1b — por el enfoque GPR + coeficientes de Fourier de
+la sección 2.2, entrenado contra un dataset público real con
+cinemática + antropometría por sujeto (ninguno encontrado hasta ahora
+tiene el punto de montaje protésico real — ver Pregunta abierta #8).
+Luis decidió (2026-08-19) retomar esta investigación desde cero en un
+proyecto aparte, no continuarla en esta carpeta — ver Pregunta abierta
+#9.
 
 ### Fase 3 — Integración a la app (no iniciado, depende de que Horizonte 2 esté listo, per pedido explícito de Luis)
 - Nuevo módulo `src/utils/trajectory_synthesizer.py` (nombre
@@ -417,18 +343,21 @@ preguntas abiertas #2 y #4 sin resolver.
    `apoyo_test.csv` es claramente un archivo de prueba (3 puntos) — no
    hay curva de referencia real de apoyo todavía en el repo.
 8. **¿Vale la pena Fase 2 dado que ningún dataset público tiene el
-   punto de montaje protésico real (sección 2.5)?** Mejora solo el
-   modelado del patrón general de marcha (paso 1a) con datos de
-   sujetos sanos — el paso específico a la prótesis (1b) no se
-   beneficia. Confirmar que ese alcance parcial sigue siendo valioso
-   antes de invertir tiempo en el pipeline GPR+Fourier.
-9. **¿Qué dataset usar para Fase 2?** (investigación 2026-08-19,
-   sección 2.5) — Moreira/Figueiredo (16 sujetos, simple, buen punto de
-   partida) vs. Camargo (1,798 sujetos, más esfuerzo de limpieza, mejor
-   generalización) vs. otro. Decisión de Luis, no algo que se pueda
-   inferir del código — afecta rigor/alcance de tesis y cuánto esfuerzo
-   de limpieza de datos se invierte antes de tener el pipeline
-   funcionando end-to-end.
+   punto de montaje protésico real?** Mejora solo el modelado del
+   patrón general de marcha (paso 1a) con datos de sujetos sanos — el
+   paso específico a la prótesis (1b) no se beneficia. Confirmar que
+   ese alcance parcial sigue siendo valioso antes de invertir tiempo en
+   el pipeline GPR+Fourier.
+9. **¿Qué dataset usar para Fase 2?** Decisión de Luis, no algo que se
+   pueda inferir del código — afecta rigor/alcance de tesis y cuánto
+   esfuerzo de limpieza de datos se invierte antes de tener el pipeline
+   funcionando end-to-end. **PAUSADA 2026-08-19**: Luis decidió retomar
+   esta búsqueda desde cero en un proyecto aparte (fuera de
+   gaitsim-control) en vez de continuarla acá, para poder supervisar/
+   entender el análisis completo él mismo en vez de heredar
+   investigación no revisada. Esta carpeta queda en espera de
+   integración (ver Estado al inicio del archivo) hasta que ese trabajo
+   avance y se decida traerlo de vuelta.
 
 ## 6. Estado del prototipo (`prototype.py`)
 
