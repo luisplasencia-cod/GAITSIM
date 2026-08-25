@@ -439,6 +439,39 @@ once it finishes, so its live position polling is visible for the
 whole move. Both changes confirmed on real hardware same day, no
 problems reported.
 
+`MANUAL`/`STOP` struck through in docs/protocol.md (2026-08-25, Luis's
+decision, discussed in chat, not yet re-verified on real hardware since
+nothing changed in code): confirmed neither wire command has a real
+send path in the app. `manual_joystick.py`'s jog buttons call
+`SystemStateMachine.move_relative()`, which — since the 2026-07-23
+rewrite — sends a single-axis trajectory via TRAJ_BEGIN/TRAJ_POINT/
+TRAJ_END + RUN, not `<MANUAL:axis:direction:steps>`. `<STOP>` has zero
+callers anywhere in `src/`, including test scripts.
+`ESP32Controller.move_manual()`/`.stop()` and their `protocol.py`
+builders still exist, correct and covered by
+`tests/manual_test_state_machine.py` (a standalone script, not part of
+the app) — just unreachable from the real UI. Explicit decision: keep
+the current UI as-is (joystick via `move_relative()`, one mandatory
+`HOME` per session before `IDLE`/manual movement is allowed) rather
+than rewire the joystick onto raw `MANUAL`, so these two wire commands
+stay struck through (not deleted) in `docs/protocol.md` as
+spec-complete-but-unused. Flagged because this was actively confusing
+the teammate implementing the definitive ESP32 firmware, who is
+expected to follow `docs/protocol.md` as the authoritative contract
+(Hard Rule 5) without knowing which parts of it the reference app
+never actually exercises.
+
+Open design question surfaced but NOT decided, parked for whenever
+Horizon 2 (definitive firmware, real motors) becomes relevant: on real
+hardware a `MANUAL` move of many steps takes real time, unlike the test
+firmware's instantaneous simulated version — at that point `STOP`
+mid-move (interrupting a jog before it collides) would need the
+firmware to poll serial during the move and the protocol to specify
+that timing/interruption semantics explicitly, which it does not today.
+Revisit only if/when someone decides to make raw stepwise jogging (not
+`move_relative()`'s trajectory-based jog) the real mechanism — until
+then this remains theoretical, not a task.
+
 ## Deferred / not built yet (do not build unless explicitly asked)
 GUI polish (splash screen, branding), user management, pathology
 library, automatic reports, Digital Twin, sensor integration beyond
