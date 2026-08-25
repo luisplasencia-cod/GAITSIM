@@ -142,13 +142,40 @@ una trayectoria.
 
 | Comando | Formato | Respuesta |
 |---|---|---|
-| Movimiento manual | `<MANUAL:axis:direction:steps>` | `OK` o `ERROR:<code>:<msg>` |
-| Stop | `<STOP>` | `STOPPED` |
+| ~~Movimiento manual~~ | ~~`<MANUAL:axis:direction:steps>`~~ | ~~`OK` o `ERROR:<code>:<msg>`~~ |
+| ~~Stop~~ | ~~`<STOP>`~~ | ~~`STOPPED`~~ |
 
 - `<axis>`: `X` (horizontal), `Y` (vertical), `A` (ángulo sagital)
 - `<direction>`: entero, `1` = `+`, `0` = `-` (ver la nota de
   Transporte sobre tipos de argumento arriba)
 - `<steps>`: entero positivo
+
+**⚠️ Sin ruta de uso real en la app (anotado 25-ago-2026, decisión de
+Luis) — tachado, no borrado.** El movimiento manual real de la UI
+(`src/ui/manual_joystick.py`) no llama a `MANUAL`: usa
+`SystemStateMachine.move_relative()`, que genera una micro-trayectoria
+de un solo eje y la ejecuta por el protocolo de `TRAJ_BEGIN/TRAJ_POINT/
+TRAJ_END` + `RUN` (ver más abajo), no por `<MANUAL:axis:direction:
+steps>`. `<STOP>` no tiene ningún caller en todo `src/`, ni siquiera en
+el script de prueba suelto `tests/manual_test_state_machine.py` (ese sí
+llama a `move_manual()`/`<MANUAL:...>` directamente, pero fuera de la
+app real). Decisión explícita: mantener la UI actual como está
+(joystick vía `move_relative()`, `HOME` obligatorio una vez por sesión
+antes de llegar a `IDLE`) — con eso, ninguno de los dos comandos de
+esta sección llega nunca a enviarse desde la aplicación.
+
+Se dejan tachados en vez de eliminarse porque: (1) el código que los
+implementa (`ESP32Controller.move_manual()`/`.stop()`,
+`protocol.build_manual()`/`.build_stop()`, y `handleManual()`/
+`handleStop()` del firmware de prueba) sigue existiendo, correcto y
+probado, solo sin caller de producción; y (2) el firmware definitivo
+(Horizonte 2, en desarrollo por el compañero de equipo) podría seguir
+necesitando implementarlos por completitud del contrato, aunque esta
+app no los ejercite. Si en el futuro se decide activar el jog crudo
+por pasos como mecanismo real (con motores reales que sí tardan, donde
+`STOP` interrumpiría un `MANUAL` a mitad de camino), esta sección
+necesitará además especificar esa semántica de tiempo real — no basta
+con destachar la tabla.
 
 ## Comandos de Posicionamiento Absoluto
 
