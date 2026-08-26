@@ -21,6 +21,12 @@ firmware (de prueba o definitivo) debe cumplirlo.
 | Ping | `<PING>` | `PONG` |
 | Home | `<HOME>` | `READY` o `ERROR:<code>:<msg>` |
 
+**¿Cuándo los pide la RPi?**
+- `PING`: al tocar "Conectar" (barra superior) — antes de mostrar
+  "Conectado", para confirmar que hay un ESP32 de verdad respondiendo.
+- `HOME`: al tocar "Calibrar (Home)" en la pantalla de Inicio, el único
+  botón habilitado justo después de conectar.
+
 **Ejemplo real** (conectar + calibrar):
 ```
 >> <PING>
@@ -70,6 +76,12 @@ caso además de los comandos mismos):
   `STEPS_PER_CM_Y = 800`, `STEPS_PER_DEG_ANGLE ≈ 111.11` (= 50×800/360
   — reducción angular × pasos/rev del motor, ÷ 360).
 
+**¿Cuándo se usa?** Estos eventos no se piden — salen solos, del ESP32,
+como parte de `HOME`. La RPi los usa para dibujar el mapa de espacio
+disponible ("Espacio Disponible" en la barra de navegación) y para
+mostrar en vivo "Calibrando eje Y: límite máximo alcanzado..." mientras
+dura el barrido.
+
 ## Movimiento Manual
 
 | Comando | Formato | Respuesta |
@@ -79,9 +91,10 @@ caso además de los comandos mismos):
 `axis`: `X`/`Y`/`A`. `direction`: `1`=`+`, `0`=`-`. `steps`: entero
 positivo.
 
-**No lo implementes todavía** — la app hoy no lo usa (el joystick
-manda trayectorias, ver abajo). No rompe nada si tu firmware no lo
-reconoce.
+**¿Cuándo se usa?** Nunca, hoy — cuando el operador mueve el joystick
+en la pantalla de Inicio, la RPi NO manda `MANUAL`, manda una
+trayectoria de 1 solo eje (ver sección Trayectorias abajo). No lo
+implementes todavía; no rompe nada si tu firmware no lo reconoce.
 
 ## Consulta de Posición
 
@@ -91,6 +104,12 @@ reconoce.
 
 Pasos crudos de motor, enteros, posición **absoluta** (no delta) desde
 el `HOME` más reciente. Misma conversión que la calibración.
+
+**¿Cuándo lo pide la RPi?** Cada 200ms, sin parar, mientras el panel
+"Monitor Posición" está abierto (para animar la plataforma en
+pantalla) — y una vez, puntual, antes de generar cualquier movimiento
+(joystick, retorno seguro entre ensayos), para saber desde dónde
+partir.
 
 **Ejemplo real:**
 ```
@@ -112,6 +131,15 @@ el `HOME` más reciente. Misma conversión que la calibración.
 | Reanudar | `<RESUME>` | `RUNNING` |
 | Abortar | `<ABORT>` (solo válido en `PAUSED`) | `ABORTED` o `ERROR:INVALID_STATE:...` |
 | Progreso (no solicitado) | `TRAJ_PROGRESS:<t>:<x>:<y>:<angle>` | — |
+
+**¿Cuándo pide la RPi `TRAJ_BEGIN...RUN`?** En 4 momentos, siempre por
+el mismo camino:
+1. Tocar "Load && Send" en la pantalla de Trayectorias — el ensayo CSV.
+2. La primera vez que se toca "Ir a Posición Inicial" después de un `HOME`.
+3. Mover el joystick manual (cada toque de flecha genera y envía su
+   propia trayectoria de 1 eje).
+4. Tocar "Reiniciar Ensayo", "Elegir Otro Ensayo", o volver a "Ir a
+   Posición Inicial" ya con una posición previa registrada.
 
 **`TRAJ_POINT` es un DELTA, no una posición absoluta**: `dt_ms` =
 milisegundos desde el punto anterior. `dx/dy/dangle_steps` = pasos con
@@ -146,6 +174,12 @@ punto. `t` es tiempo en segundos, sin cambios.
 ```
 (3cm = 1200 pasos, 5cm = 2000 pasos — `STEPS_PER_CM_X` = 400)
 
+**¿Cuándo pide `PAUSE`/`RESUME`/`ABORT`?** Los botones "Pause"/"Resume"
+de la pantalla de Trayectorias mandan `PAUSE`/`RESUME` directo,
+mientras el ensayo está corriendo. `ABORT` sale automáticamente al
+tocar "Reiniciar Ensayo" o "Elegir Otro Ensayo" si el ensayo estaba en
+pausa.
+
 **Ejemplo real — Pause/Resume/Abort** (a mitad de otra trayectoria):
 ```
 >> <PAUSE>
@@ -160,11 +194,6 @@ punto. `t` es tiempo en segundos, sin cambios.
 ```
 `PAUSE` se reanuda con `RESUME` exactamente donde iba, sin reenviar
 nada. `ABORT` descarta el resto de la trayectoria y vuelve a `IDLE`.
-
-Esta secuencia completa (`TRAJ_BEGIN`...`RUN`...`FINISHED`) es la
-ÚNICA forma en que la interfaz mueve el sistema — ensayo CSV, joystick
-manual, ir a posición inicial, y retorno seguro entre ensayos usan
-exactamente este mismo camino, nunca otro.
 
 ## Errores
 
