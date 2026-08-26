@@ -30,16 +30,15 @@ SystemState currentState = STATE_DISCONNECTED;
 // ---------------------------------------------------------------------
 // Tracked position (x, y, angle), reset to (0, 0, 0) by HOME
 // ---------------------------------------------------------------------
-// The Raspberry Pi never converts steps to real units itself (see
-// docs/protocol.md, Absolute Positioning Commands) — it relies on this
-// firmware to track the result of MANUAL moves and report it back via
-// GET_POSITION. TEST_UNITS_PER_STEP is an arbitrary placeholder
-// (cm or deg per step) purely for exercising that flow with the test
-// firmware; it does not represent any real mechanical calibration.
-float posX = 0.0;
-float posY = 0.0;
-float posAngle = 0.0;
-const float TEST_UNITS_PER_STEP = 0.05;
+// Tracked NATIVELY in raw motor steps (2026-08-26) — matches how
+// GET_POSITION reports it AND how TRAJ_POINT now commands movement
+// (see docs/protocol.md, "Cambio 2026-08-26 (trayectorias en pasos)").
+// No unit conversion happens anywhere in this firmware anymore: the
+// Raspberry Pi does all cm/deg<->steps conversion on its side before
+// ever putting a number on the wire.
+long posXSteps = 0;
+long posYSteps = 0;
+long posAngleSteps = 0;
 
 // ---------------------------------------------------------------------
 // Trajectory buffer (simulated storage)
@@ -48,17 +47,31 @@ const float TEST_UNITS_PER_STEP = 0.05;
 // may size this differently based on real available RAM.
 const int MAX_TRAJECTORY_POINTS = 300;
 
-struct TrajectoryPoint {
-  float t;
-  float x;
-  float y;
-  float angle;
+// Each stored point is a DELTA as received on the wire (dtMs since the
+// previous point, signed step deltas per axis) — see handleTrajPoint().
+// ALREADY ACCUMULATED into absolute step positions at receive time
+// (xSteps/ySteps/angleSteps below are cumulative, not the raw delta),
+// so handleRun() can just apply them directly without re-deriving
+// anything at execution time.
+struct TrajectoryStepPoint {
+  unsigned long dtMs;
+  long xSteps;
+  long ySteps;
+  long angleSteps;
 };
 
-TrajectoryPoint trajectoryBuffer[MAX_TRAJECTORY_POINTS];
+TrajectoryStepPoint trajectoryBuffer[MAX_TRAJECTORY_POINTS];
 int expectedPointCount = 0;
 int receivedPointCount = 0;
 bool trajectoryStored = false;
+// Running accumulator while RECEIVING_TRAJECTORY — starts at whatever
+// posXSteps/posYSteps/posAngleSteps were when TRAJ_BEGIN arrived (see
+// handleTrajBegin()), since every delta is relative to the point
+// before it, and the first delta is relative to wherever the platform
+// currently is.
+long trajAccumXSteps = 0;
+long trajAccumYSteps = 0;
+long trajAccumAngleSteps = 0;
 
 // ---------------------------------------------------------------------
 // Serial line buffer
@@ -74,7 +87,7 @@ String inputLine = "";
 
 // pollSerial() is defined near the bottom of this file (it calls
 // processLine(), defined in the dispatch section below), but handleRun()
-// needs to call it WHILE a trajectory is executing, so PAUSE/STOP/RESUME
+// needs to call it WHILE a trajectory is executing, so PAUSE/RESUME
 // commands actually get read instead of sitting unprocessed in the UART
 // buffer until the whole run finishes.
 void pollSerial();
@@ -120,55 +133,55 @@ void handlePing() {
 // ---------------------------------------------------------------------
 // Calibration (limit-mapping) simulation
 // ---------------------------------------------------------------------
-// Placeholder full-travel values per axis (cm for Y/X, degrees for A) —
-// arbitrary, purely to exercise the LIM*MIN -> CAL_PROGRESS -> LIM*MAX
-// event sequence defined in docs/protocol.md; not tied to any real
-// mechanical dimension (same spirit as TEST_UNITS_PER_STEP above). All
-// 3 axes are raw/limit-relative here: LIM*MIN is that axis's zero, and
-// CAL_PROGRESS/LIM*MAX count up from it. The angular axis's "relative
-// to horizontal" reinterpretation (there's a real physical offset
-// between "touching the lower limit switch" and "level") is applied
-// entirely on the Raspberry Pi side (see
-// SystemStateMachine.ANGLE_HORIZONTAL_OFFSET_DEG in system_state.py) —
-// this firmware doesn't need to know about it.
-const float CAL_Y_MAX_CM = 100.0;
-const float CAL_X_MAX_CM = 100.0;
-const float CAL_ANGLE_MAX_DEG = 120.0;
+// Real max step-count ceilings for Y/X (2026-08-26), from the
+// teammate's definitive-firmware motion-data generation script
+// (leadscrew pitch + motor microstepping of the real rig) — no longer
+// arbitrary placeholders like TEST_UNITS_PER_STEP above, since
+// LIM{AXIS}MAX now reports raw motor steps on the wire instead of the
+// ESP32 pre-converting to cm/deg (see docs/protocol.md, Calibration
+// Events, "Cambio 2026-08-26"). Y/X are raw/limit-relative: LIM*MIN is
+// that axis's zero (step 0), and LIM*MAX counts up from it.
+const long CAL_Y_MAX_STEPS = 72000;
+const long CAL_X_MAX_STEPS = 48000;
 
-// Simulated duration of the travel-to-max phase, per axis, and how
-// often CAL_PROGRESS is sent during it (so the RPi side has something
-// to plot progressively, not all-at-once).
+// Angular axis limits (2026-08-26, "Cambio 2026-08-26 (eje angular)"):
+// UNLIKE Y/X, this axis's physical limit switches don't sit at
+// level/horizontal, so the ESP32 itself reports LIMANGMIN/LIMANGMAX as
+// SIGNED step counts already relative to horizontal = step 0, instead
+// of the Raspberry Pi applying a fixed offset afterward. These match
+// the teammate's HOMING_ZERO_MIN_K_STEPS/HOMING_ZERO_MAX_K_STEPS
+// (angular gearbox ratio + motor microstepping of the real rig).
+const long CAL_ANG_MIN_STEPS = -5000;
+const long CAL_ANG_MAX_STEPS = 5400;
+
+// Simulated duration of the travel-to-max phase, per axis — no
+// intermediate progress is reported anymore (CAL_PROGRESS was removed
+// from the protocol by explicit request), this is purely so HOMING
+// takes a visible moment instead of resolving instantly.
 const unsigned long CAL_AXIS_DURATION_MS = 4000;
-const unsigned long CAL_PROGRESS_INTERVAL_MS = 200;
 
-// Runs one axis's MIN -> travel -> MAX sequence.
-//   limLabel: the LIM{...} token infix, e.g. "Y", "X", "ANG"
-//   axisCode: the axis letter used in CAL_PROGRESS payloads (matches
-//             MANUAL/GOTO's axis convention: X, Y, A)
-//   maxValue: full simulated travel for this axis (cm or deg)
+// Runs one axis's MIN -> travel -> MAX sequence for Y/X, where MIN is
+// always step 0 (no argument on the wire).
+//   limLabel: the LIM{...} token infix, e.g. "Y", "X"
+//   maxSteps: full simulated travel for this axis, in raw motor steps
 //
 // Unlike every other outgoing response in this file, these calibration
-// events are wrapped in '<' '>' and CAL_PROGRESS's two arguments are
-// colon-separated (string axis first, numeric value second) — the same
-// framing/argument convention normally reserved for RPi -> ESP32
-// commands, applied here by explicit request (see docs/protocol.md,
-// Calibration Events "Framing exception"). Every other sendResponse()
-// call in this file stays unframed.
-void simulateAxisCalibration(const String &limLabel, const String &axisCode,
-                              float maxValue) {
+// events are wrapped in '<' '>'.
+void simulateAxisCalibration(const String &limLabel, long maxSteps) {
   sendResponse("<LIM" + limLabel + "MIN>");
+  delay(CAL_AXIS_DURATION_MS);
+  sendResponse("<LIM" + limLabel + "MAX:" + String(maxSteps) + ">");
+}
 
-  unsigned long start = millis();
-  unsigned long elapsed = 0;
-  while (elapsed < CAL_AXIS_DURATION_MS) {
-    delay(CAL_PROGRESS_INTERVAL_MS);
-    elapsed = millis() - start;
-    if (elapsed > CAL_AXIS_DURATION_MS) elapsed = CAL_AXIS_DURATION_MS;
-    float value = maxValue * (float(elapsed) / float(CAL_AXIS_DURATION_MS));
-    sendResponse("<CAL_PROGRESS:" + axisCode + ":" + String(value, 4) + ">");
-  }
-
-  sendResponse("<LIM" + limLabel + "MAX:" + String(maxValue, 4) + ">");
+// Runs the angular axis's MIN -> travel -> MAX sequence. UNLIKE
+// simulateAxisCalibration() above, both MIN and MAX carry a signed
+// step value here, since this axis's zero is horizontal/level, not
+// "touching the lower limit switch" (see CAL_ANG_MIN_STEPS/
+// CAL_ANG_MAX_STEPS above).
+void simulateAngularCalibration(long minSteps, long maxSteps) {
+  sendResponse("<LIMANGMIN:" + String(minSteps) + ">");
+  delay(CAL_AXIS_DURATION_MS);
+  sendResponse("<LIMANGMAX:" + String(maxSteps) + ">");
 }
 
 void handleHome() {
@@ -177,28 +190,15 @@ void handleHome() {
   // Full limit-mapping sweep, one axis at a time, in the order defined
   // by docs/protocol.md's Calibration Events section (Y, then X, then
   // Angular).
-  simulateAxisCalibration("Y", "Y", CAL_Y_MAX_CM);
-  simulateAxisCalibration("X", "X", CAL_X_MAX_CM);
-  simulateAxisCalibration("ANG", "A", CAL_ANGLE_MAX_DEG);
+  simulateAxisCalibration("Y", CAL_Y_MAX_STEPS);
+  simulateAxisCalibration("X", CAL_X_MAX_STEPS);
+  simulateAngularCalibration(CAL_ANG_MIN_STEPS, CAL_ANG_MAX_STEPS);
 
-  posX = 0.0;
-  posY = 0.0;
-  posAngle = 0.0;
+  posXSteps = 0;
+  posYSteps = 0;
+  posAngleSteps = 0;
   currentState = STATE_IDLE;
   sendResponse("READY");
-}
-
-void handleStatus() {
-  String stateStr;
-  switch (currentState) {
-    case STATE_DISCONNECTED: stateStr = "DISCONNECTED"; break;
-    case STATE_IDLE: stateStr = "IDLE"; break;
-    case STATE_HOMING: stateStr = "HOMING"; break;
-    case STATE_RECEIVING_TRAJECTORY: stateStr = "RECEIVING_TRAJECTORY"; break;
-    case STATE_RUNNING: stateStr = "RUNNING"; break;
-    case STATE_PAUSED: stateStr = "PAUSED"; break;
-  }
-  sendResponse("STATUS:" + stateStr);
 }
 
 void handleManual(const String &line) {
@@ -228,49 +228,20 @@ void handleManual(const String &line) {
     sendError("INVALID_DIRECTION", String(direction));
     return;
   }
-  // Simulated: no real limit checking yet.
-  float delta = steps * TEST_UNITS_PER_STEP * (direction == 1 ? 1.0 : -1.0);
-  if (axis == "X") posX += delta;
-  else if (axis == "Y") posY += delta;
-  else if (axis == "A") posAngle += delta;
+  // Simulated: no real limit checking yet. Position is step-native, so
+  // this is a direct add — no unit conversion needed (unlike before
+  // 2026-08-26, when position was tracked in cm/deg internally).
+  long delta = (long)steps * (direction == 1 ? 1 : -1);
+  if (axis == "X") posXSteps += delta;
+  else if (axis == "Y") posYSteps += delta;
+  else if (axis == "A") posAngleSteps += delta;
 
-  sendResponse("OK");
-}
-
-void handleGoTo(const String &line) {
-  if (currentState != STATE_IDLE) {
-    sendError("INVALID_STATE", "goto not allowed in current state");
-    return;
-  }
-  // Format: GOTO:<x>:<y>:<angle>
-  int colonIdx = line.indexOf(':');
-  String data = line.substring(colonIdx + 1);
-
-  int c1 = data.indexOf(':');
-  int c2 = data.indexOf(':', c1 + 1);
-  if (c1 == -1 || c2 == -1) {
-    sendError("MALFORMED", "expected GOTO:<x>:<y>:<angle>");
-    return;
-  }
-
-  posX = data.substring(0, c1).toFloat();
-  posY = data.substring(c1 + 1, c2).toFloat();
-  posAngle = data.substring(c2 + 1).toFloat();
-
-  // Simulated: instantaneous move, no real motor timing yet.
   sendResponse("OK");
 }
 
 void handleGetPosition() {
-  sendResponse("POSITION:" + String(posX, 4) + ":" + String(posY, 4) +
-               ":" + String(posAngle, 4));
-}
-
-void handleStop() {
-  if (currentState == STATE_RUNNING) {
-    currentState = STATE_PAUSED;
-  }
-  sendResponse("STOPPED");
+  sendResponse("POSITION:" + String(posXSteps) + ":" + String(posYSteps) +
+               ":" + String(posAngleSteps));
 }
 
 void handleTrajBegin(const String &line) {
@@ -292,6 +263,12 @@ void handleTrajBegin(const String &line) {
   expectedPointCount = n_points;
   receivedPointCount = 0;
   trajectoryStored = false;
+  // Every delta point is relative to the one before it, and the FIRST
+  // delta is relative to wherever the platform currently is — so the
+  // accumulator starts at the tracked position, not at zero.
+  trajAccumXSteps = posXSteps;
+  trajAccumYSteps = posYSteps;
+  trajAccumAngleSteps = posAngleSteps;
   currentState = STATE_RECEIVING_TRAJECTORY;
   sendResponse("TRAJ_READY");
 }
@@ -305,25 +282,26 @@ void handleTrajPoint(const String &line) {
     sendError("POINT_COUNT_MISMATCH", "received more points than announced");
     return;
   }
-  // Format: TRAJ_POINT:<t>:<x>:<y>:<angle>
-  int colonIdx = line.indexOf(':');
-  String data = line.substring(colonIdx + 1);
-
-  int c1 = data.indexOf(':');
-  int c2 = data.indexOf(':', c1 + 1);
-  int c3 = data.indexOf(':', c2 + 1);
-  if (c1 == -1 || c2 == -1 || c3 == -1) {
-    sendError("MALFORMED", "expected TRAJ_POINT:<t>:<x>:<y>:<angle>");
+  // Format (2026-08-26): TRAJ_POINT:<dt_ms>:<dx_steps>:<dy_steps>:<dangle_steps>
+  // — a signed step DELTA from the previous point (or from the current
+  // tracked position, for the first point), NOT an absolute position
+  // (see docs/protocol.md, "Cambio 2026-08-26 (trayectorias en pasos)").
+  String parts[5];
+  int n = splitCommand(line, parts, 5);
+  if (n != 5) {
+    sendError("MALFORMED", "expected TRAJ_POINT:<dt_ms>:<dx>:<dy>:<dangle>");
     return;
   }
+  unsigned long dtMs = (unsigned long)parts[1].toInt();
+  long dxSteps = parts[2].toInt();
+  long dySteps = parts[3].toInt();
+  long dangleSteps = parts[4].toInt();
 
-  TrajectoryPoint pt;
-  pt.t = data.substring(0, c1).toFloat();
-  pt.x = data.substring(c1 + 1, c2).toFloat();
-  pt.y = data.substring(c2 + 1, c3).toFloat();
-  pt.angle = data.substring(c3 + 1).toFloat();
+  trajAccumXSteps += dxSteps;
+  trajAccumYSteps += dySteps;
+  trajAccumAngleSteps += dangleSteps;
 
-  trajectoryBuffer[receivedPointCount] = pt;
+  trajectoryBuffer[receivedPointCount] = {dtMs, trajAccumXSteps, trajAccumYSteps, trajAccumAngleSteps};
   receivedPointCount++;
 
   sendResponse("ACK:" + String(receivedPointCount - 1));
@@ -363,16 +341,23 @@ void handleRun() {
   //
   // IMPORTANT: the only place this sketch normally reads Serial is
   // loop()'s top-level while-loop. Since this whole run happens nested
-  // inside a single call to handleRun(), a PAUSE/STOP sent mid-run would
+  // inside a single call to handleRun(), a PAUSE sent mid-run would
   // otherwise sit unread in the UART buffer until every point finished.
   // pollSerial() is called explicitly below (both while waiting between
   // points and while paused) so those commands are actually processed
   // in time, and RESUME can continue the same for loop where it left off.
+  //
+  // elapsedMs accumulates each point's dtMs into a running total, purely
+  // to give TRAJ_PROGRESS a `t` value for the live plot's X axis (see
+  // below) — unrelated to the fixed 120ms TEST-ONLY wait between
+  // sendResponse() calls a few lines down, which is what actually
+  // paces this loop, same as before 2026-08-26.
+  unsigned long elapsedMs = 0;
   for (int i = 0; i < receivedPointCount; i++) {
     // Block here, without unwinding the loop, for as long as we're
-    // paused/stopped. handlePause()/handleStop() set STATE_PAUSED;
-    // handleResume() (reached via pollSerial() -> processLine() below)
-    // sets it back to STATE_RUNNING, which ends this wait in place.
+    // paused. handlePause() sets STATE_PAUSED; handleResume() (reached
+    // via pollSerial() -> processLine() below) sets it back to
+    // STATE_RUNNING, which ends this wait in place.
     while (currentState == STATE_PAUSED) {
       pollSerial();
       delay(5);
@@ -382,20 +367,22 @@ void handleRun() {
       return;
     }
 
-    TrajectoryPoint &pt = trajectoryBuffer[i];
-    // Keep the tracked position (posX/posY/posAngle, reported by
-    // GET_POSITION) in step with actual execution, not just with
-    // MANUAL/GOTO — otherwise GET_POSITION after a PAUSE/ABORT would
-    // report stale pre-run coordinates instead of where the system
-    // actually stopped, which safe_return_to_position() (system_state.py)
-    // depends on. TRAJ_POINT coordinates are already absolute/HOME-
-    // origin-relative (trajectory_screen.py offsets them before send),
-    // so no further conversion is needed here.
-    posX = pt.x;
-    posY = pt.y;
-    posAngle = pt.angle;
-    sendResponse("TRAJ_PROGRESS:" + String(pt.t, 4) + ":" + String(pt.x, 4) +
-                 ":" + String(pt.y, 4) + ":" + String(pt.angle, 4));
+    TrajectoryStepPoint &pt = trajectoryBuffer[i];
+    // Keep the tracked position (posXSteps/posYSteps/posAngleSteps,
+    // reported by GET_POSITION) in step with actual execution, not
+    // just with MANUAL — otherwise GET_POSITION after a PAUSE/ABORT
+    // would report stale pre-run coordinates instead of where the
+    // system actually stopped, which safe_return_to_position()
+    // (system_state.py) depends on. pt already holds the ABSOLUTE
+    // accumulated step position (accumulated once, at receive time in
+    // handleTrajPoint()), so this is a direct assignment.
+    posXSteps = pt.xSteps;
+    posYSteps = pt.ySteps;
+    posAngleSteps = pt.angleSteps;
+    elapsedMs += pt.dtMs;
+    sendResponse("TRAJ_PROGRESS:" + String(elapsedMs / 1000.0, 4) + ":" +
+                 String(pt.xSteps) + ":" + String(pt.ySteps) + ":" +
+                 String(pt.angleSteps));
 
     // Wait ~120ms before the next point (TEST-ONLY cadence), polling
     // throughout so a PAUSE/STOP arriving mid-wait is noticed promptly
@@ -456,9 +443,7 @@ void handleAbort() {
 void processLine(const String &line) {
   if (line.startsWith("PING")) handlePing();
   else if (line.startsWith("HOME")) handleHome();
-  else if (line.startsWith("STATUS")) handleStatus();
   else if (line.startsWith("MANUAL")) handleManual(line);
-  else if (line.startsWith("STOP")) handleStop();
   else if (line.startsWith("TRAJ_BEGIN")) handleTrajBegin(line);
   else if (line.startsWith("TRAJ_POINT")) handleTrajPoint(line);
   else if (line.startsWith("TRAJ_END")) handleTrajEnd();
@@ -466,7 +451,6 @@ void processLine(const String &line) {
   else if (line.startsWith("PAUSE")) handlePause();
   else if (line.startsWith("RESUME")) handleResume();
   else if (line.startsWith("ABORT")) handleAbort();
-  else if (line.startsWith("GOTO")) handleGoTo(line);
   else if (line.startsWith("GET_POSITION")) handleGetPosition();
   else sendError("UNKNOWN_COMMAND", line);
 }
@@ -502,7 +486,7 @@ void pollSerial() {
         // Clear the shared global BEFORE dispatching, not after: a
         // handler like handleRun() can itself call pollSerial() again
         // (nested, while a trajectory is executing) to notice PAUSE/
-        // STOP/RESUME. If inputLine were cleared only after processLine()
+        // RESUME. If inputLine were cleared only after processLine()
         // returns, that nested call would keep appending onto the SAME
         // still-populated buffer (e.g. "RUN" + "PAUSE" -> "RUNPAUSE",
         // which startsWith("RUN") and wrongly re-triggers handleRun()).

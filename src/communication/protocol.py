@@ -36,10 +36,8 @@ from typing import Optional
 
 CMD_PING = "PING"
 CMD_HOME = "HOME"
-CMD_STATUS = "STATUS"
 
 CMD_MANUAL = "MANUAL"        # MANUAL:<axis>:<direction>:<steps>
-CMD_STOP = "STOP"
 
 # Wire encoding for the `direction` field of MANUAL: everything
 # past a command's first argument must be an integer (see docs/protocol.md,
@@ -58,7 +56,6 @@ CMD_PAUSE = "PAUSE"
 CMD_RESUME = "RESUME"
 CMD_ABORT = "ABORT"     # abandon a PAUSED trajectory entirely -> IDLE
 
-CMD_GOTO = "GOTO"                   # GOTO:<x>:<y>:<angle>
 CMD_GET_POSITION = "GET_POSITION"
 
 
@@ -69,7 +66,6 @@ CMD_GET_POSITION = "GET_POSITION"
 RESP_PONG = "PONG"
 RESP_READY = "READY"
 RESP_OK = "OK"
-RESP_STOPPED = "STOPPED"
 RESP_TRAJ_READY = "TRAJ_READY"
 RESP_TRAJ_STORED = "TRAJ_STORED"
 RESP_RUNNING = "RUNNING"
@@ -77,7 +73,6 @@ RESP_FINISHED = "FINISHED"
 RESP_PAUSED = "PAUSED"
 RESP_ABORTED = "ABORTED"
 
-RESP_STATUS_PREFIX = "STATUS:"
 RESP_ACK_PREFIX = "ACK:"
 RESP_ERROR_PREFIX = "ERROR:"
 RESP_TRAJ_PROGRESS_PREFIX = "TRAJ_PROGRESS:"
@@ -85,31 +80,35 @@ RESP_POSITION_PREFIX = "POSITION:"
 
 # Calibration events (unsolicited, during HOMING) — see docs/protocol.md,
 # "Calibration Events" section. On the wire these arrive wrapped in
-# '<' '>' (e.g. "<LIMYMIN>", "<CAL_PROGRESS:Y:15.0000>") — the constants
-# below are matched against the ALREADY-UNWRAPPED text (parse_response()
-# strips the framing before any comparison happens). All 3 axes are
-# treated uniformly on the wire: MIN carries no argument (that axis's
-# min limit switch IS raw zero); MAX carries the value at that axis's
-# max limit switch as its one argument; CAL_PROGRESS carries axis
-# (string) then value (numeric), colon-separated. This is the one
-# ESP32 -> RPi exception to the "responses are unframed" rule (see
-# Transport in docs/protocol.md).
+# '<' '>' (e.g. "<LIMYMIN>", "<LIMYMAX:72000>") — the constants below
+# are matched against the ALREADY-UNWRAPPED text (parse_response()
+# strips the framing before any comparison happens). MAX always carries
+# the raw motor STEP COUNT at that axis's max limit switch as its one
+# argument (NOT cm/deg — see docs/protocol.md, "Cambio 2026-08-26").
+# This is the one ESP32 -> RPi exception to the "responses are
+# unframed" rule (see Transport in docs/protocol.md).
 #
-# The angular axis's "relative to horizontal" reinterpretation (its raw
-# limit-relative sweep is NOT the same as degrees from level) is a pure
-# RPi-side business-logic concern, NOT a wire-format one — see
-# SystemStateMachine.ANGLE_HORIZONTAL_OFFSET_DEG in system_state.py.
-# protocol.py stays hardware/business-logic-agnostic (see module
-# docstring) and reports the raw, limit-relative values for all 3 axes.
+# Y/X MIN carry no argument (that axis's min limit switch IS raw step
+# zero). The angular axis is DIFFERENT since 2026-08-26 (see
+# docs/protocol.md, "Cambio 2026-08-26 (eje angular)"): its physical
+# limit switches don't sit at "level/horizontal", so the ESP32 itself
+# reports LIMANGMIN/LIMANGMAX as SIGNED step counts already relative to
+# horizontal = step 0 (e.g. -5000 at the lower switch, 5400 at the
+# upper one) instead of the RPi applying a fixed offset afterward. This
+# is the one place the 3 axes are NOT wire-uniform.
+#
+# The steps->cm/deg conversion itself is a pure RPi-side business-logic
+# concern, NOT a wire-format one — see SystemStateMachine.STEPS_PER_CM_Y/
+# STEPS_PER_CM_X/STEPS_PER_DEG_ANGLE in system_state.py. protocol.py
+# stays hardware/business-logic-agnostic (see module docstring) and
+# reports the raw step counts exactly as sent.
 RESP_LIM_Y_MIN = "LIMYMIN"
 RESP_LIM_X_MIN = "LIMXMIN"
-RESP_LIM_ANG_MIN = "LIMANGMIN"
+RESP_LIM_ANG_MIN_PREFIX = "LIMANGMIN:"
 
 RESP_LIM_Y_MAX_PREFIX = "LIMYMAX:"
 RESP_LIM_X_MAX_PREFIX = "LIMXMAX:"
 RESP_LIM_ANG_MAX_PREFIX = "LIMANGMAX:"
-
-RESP_CAL_PROGRESS_PREFIX = "CAL_PROGRESS:"
 
 # Maps a ParsedResponse.kind to (axis, bound) for every calibration
 # limit event, so callers don't need to know the wire tokens themselves
@@ -131,14 +130,26 @@ CALIBRATION_LIMIT_KINDS = {
 @dataclass
 class TrajectoryPoint:
     """
-    A single sample of a gait trajectory.
+    A single ABSOLUTE sample of a gait trajectory, in cm/cm/degrees —
+    this is the type used everywhere in the app that deals with
+    trajectories as real-unit positions over time: CSV loading
+    (trajectory_loader.py), generation (trajectory_generator.py),
+    range validation (trajectory_validator.py), and the live plot.
 
     Attributes:
         t: Time value, in seconds, relative to the start of the cycle.
-        x: Horizontal axis position (units defined by the mechanical
-           design / firmware calibration, e.g. mm).
-        y: Vertical axis position (same unit convention as x).
+        x: Horizontal axis position, in cm.
+        y: Vertical axis position, in cm.
         angle: Sagittal rotation angle, in degrees.
+
+    NOT what actually goes out on the wire as TRAJ_POINT since
+    2026-08-26 — see TrajectoryStepDelta below for that (a delta in raw
+    steps, produced from a `List[TrajectoryPoint]` by
+    `SystemStateMachine` right before sending). `parse_trajectory_progress()`
+    also reuses this type for the INCOMING TRAJ_PROGRESS event, but
+    there `x`/`y`/`angle` are raw steps, not cm/deg (see that
+    function's docstring) — same context-dependent-units caveat as
+    `Position` below.
     """
     t: float
     x: float
@@ -147,14 +158,49 @@ class TrajectoryPoint:
 
 
 @dataclass
+class TrajectoryStepDelta:
+    """
+    A single WIRE-LEVEL trajectory point (2026-08-26, "Cambio 2026-08-26
+    (trayectorias en pasos)", see docs/protocol.md) — what actually goes
+    out as TRAJ_POINT, as opposed to TrajectoryPoint above (an absolute
+    cm/deg/seconds point, used everywhere else in the app: CSV loading,
+    trajectory generation, range validation, the live plot).
+
+    Unlike TrajectoryPoint, this is a DELTA relative to the point
+    before it (or, for the first delta, relative to wherever the
+    platform physically is when the trajectory starts) — NOT an
+    absolute position. `SystemStateMachine` is the only place that
+    converts a `List[TrajectoryPoint]` into a `List[TrajectoryStepDelta]`
+    before handing it to `ESP32Controller.send_trajectory()`.
+
+    Attributes:
+        dt_ms: Milliseconds elapsed since the previous point (integer,
+            rounded — NOT necessarily uniform between points).
+        dx_steps: Signed raw motor step delta on the X axis.
+        dy_steps: Signed raw motor step delta on the Y axis.
+        dangle_steps: Signed raw motor step delta on the angular axis.
+    """
+    dt_ms: int
+    dx_steps: int
+    dy_steps: int
+    dangle_steps: int
+
+
+@dataclass
 class Position:
     """
-    An absolute (x, y, angle) position, in the same units and reference
-    frame as TrajectoryPoint's x/y/angle (cm, cm, degrees, relative to
-    the (0, 0, 0) established by the most recent HOME). Kept as a
-    separate type from TrajectoryPoint because a position has no time
-    component — used by GOTO/GET_POSITION and the initial-position
-    library (src/utils/position_library.py).
+    An absolute (x, y, angle) position, relative to the (0, 0, 0)
+    established by the most recent HOME. Kept as a separate type from
+    TrajectoryPoint because a position has no time component — used by
+    GET_POSITION and the initial-position library
+    (src/utils/position_library.py).
+
+    UNITS ARE CONTEXT-DEPENDENT, unlike TrajectoryPoint (always cm/cm/
+    degrees): `ESP32Controller.get_position()` (raw wire layer) returns
+    this in raw motor STEP counts (see docs/protocol.md, Consulta de
+    Posición); everywhere else in the app (SystemStateMachine.get_position(),
+    position_library.py, UI code) it's cm/cm/degrees. Check which layer
+    produced the instance before using its fields.
     """
     x: float
     y: float
@@ -167,13 +213,12 @@ class ParsedResponse:
     Result of parsing a single line received from the ESP32.
 
     Attributes:
-        kind: One of "OK", "ERROR", "STATUS", "ACK", "READY", "PONG",
-              "RUNNING", "FINISHED", "PAUSED", "ABORTED", "STOPPED",
-              "TRAJ_READY", "TRAJ_STORED", "TRAJ_PROGRESS", "POSITION",
-              "LIMYMIN", "LIMXMIN", "LIMANGMIN", "LIMYMAX", "LIMXMAX",
-              "LIMANGMAX", "CAL_PROGRESS" (see CALIBRATION_LIMIT_KINDS),
-              or "UNKNOWN" if the line did not match any known response
-              format.
+        kind: One of "OK", "ERROR", "ACK", "READY", "PONG", "RUNNING",
+              "FINISHED", "PAUSED", "ABORTED", "TRAJ_READY",
+              "TRAJ_STORED", "TRAJ_PROGRESS", "POSITION", "LIMYMIN",
+              "LIMXMIN", "LIMANGMIN", "LIMYMAX", "LIMXMAX",
+              "LIMANGMAX" (see CALIBRATION_LIMIT_KINDS), or "UNKNOWN" if
+              the line did not match any known response format.
         payload: Additional data extracted from the line, when applicable
                  (e.g. the status string, the ACK index, or the error
                  code/message). None if not applicable.
@@ -196,11 +241,6 @@ def build_ping() -> str:
 def build_home() -> str:
     """Build a HOME command frame (triggers homing + limit mapping)."""
     return f"<{CMD_HOME}>"
-
-
-def build_status_query() -> str:
-    """Build a STATUS command frame."""
-    return f"<{CMD_STATUS}>"
 
 
 def build_manual_move(axis: str, direction: str, steps: int) -> str:
@@ -230,11 +270,6 @@ def build_manual_move(axis: str, direction: str, steps: int) -> str:
     return f"<{CMD_MANUAL}:{axis}:{_DIRECTION_WIRE_CODE[direction]}:{steps}>"
 
 
-def build_stop() -> str:
-    """Build a STOP command frame (emergency stop / pause during run)."""
-    return f"<{CMD_STOP}>"
-
-
 def build_trajectory_begin(n_points: int) -> str:
     """
     Build a TRAJ_BEGIN command frame, announcing how many points will follow.
@@ -249,17 +284,17 @@ def build_trajectory_begin(n_points: int) -> str:
     return f"<{CMD_TRAJ_BEGIN}:{n_points}>"
 
 
-def build_trajectory_point(point: TrajectoryPoint) -> str:
+def build_trajectory_step_point(delta: TrajectoryStepDelta) -> str:
     """
-    Build a TRAJ_POINT command frame for a single trajectory sample.
-
-    Numeric values are formatted with fixed precision (4 decimals) to
-    keep message size predictable and avoid locale-dependent formatting
-    surprises (e.g. comma vs. dot as decimal separator).
+    Build a TRAJ_POINT command frame for a single wire-level trajectory
+    delta (see TrajectoryStepDelta and docs/protocol.md, "Cambio
+    2026-08-26 (trayectorias en pasos)"). All 4 fields are plain
+    integers (no decimals — dt_ms and every step count are already
+    whole numbers by the time they reach here).
     """
     return (
         f"<{CMD_TRAJ_POINT}:"
-        f"{point.t:.4f}:{point.x:.4f}:{point.y:.4f}:{point.angle:.4f}>"
+        f"{delta.dt_ms}:{delta.dx_steps}:{delta.dy_steps}:{delta.dangle_steps}>"
     )
 
 
@@ -292,18 +327,6 @@ def build_abort() -> str:
     return f"<{CMD_ABORT}>"
 
 
-def build_goto_position(position: Position) -> str:
-    """
-    Build a GOTO command frame, requesting an absolute move to the given
-    (x, y, angle) position. Only valid while the system is IDLE, same
-    restriction as MANUAL — the ESP32 enforces this.
-    """
-    return (
-        f"<{CMD_GOTO}:"
-        f"{position.x:.4f}:{position.y:.4f}:{position.angle:.4f}>"
-    )
-
-
 def build_get_position() -> str:
     """Build a GET_POSITION query frame."""
     return f"<{CMD_GET_POSITION}>"
@@ -333,8 +356,8 @@ def parse_response(line: str) -> ParsedResponse:
     """
     text = line.strip()
 
-    # Calibration events (LIM*MIN/MAX, CAL_PROGRESS) are, by explicit
-    # request, the only ESP32 -> RPi messages framed with '<' '>' (see
+    # Calibration events (LIM*MIN/MAX) are, by explicit request, the
+    # only ESP32 -> RPi messages framed with '<' '>' (see
     # docs/protocol.md, Calibration Events "Framing exception") — every
     # other response matched below is unframed, so this strip is a
     # no-op for all of them (none start/end with '<'/'>').
@@ -347,8 +370,6 @@ def parse_response(line: str) -> ParsedResponse:
         return ParsedResponse(kind="READY", payload=None, raw=line)
     if text == RESP_OK:
         return ParsedResponse(kind="OK", payload=None, raw=line)
-    if text == RESP_STOPPED:
-        return ParsedResponse(kind="STOPPED", payload=None, raw=line)
     if text == RESP_TRAJ_READY:
         return ParsedResponse(kind="TRAJ_READY", payload=None, raw=line)
     if text == RESP_TRAJ_STORED:
@@ -361,10 +382,6 @@ def parse_response(line: str) -> ParsedResponse:
         return ParsedResponse(kind="PAUSED", payload=None, raw=line)
     if text == RESP_ABORTED:
         return ParsedResponse(kind="ABORTED", payload=None, raw=line)
-
-    if text.startswith(RESP_STATUS_PREFIX):
-        payload = text[len(RESP_STATUS_PREFIX):]
-        return ParsedResponse(kind="STATUS", payload=payload, raw=line)
 
     if text.startswith(RESP_ACK_PREFIX):
         payload = text[len(RESP_ACK_PREFIX):]
@@ -389,8 +406,9 @@ def parse_response(line: str) -> ParsedResponse:
         return ParsedResponse(kind="LIMYMIN", payload=None, raw=line)
     if text == RESP_LIM_X_MIN:
         return ParsedResponse(kind="LIMXMIN", payload=None, raw=line)
-    if text == RESP_LIM_ANG_MIN:
-        return ParsedResponse(kind="LIMANGMIN", payload=None, raw=line)
+    if text.startswith(RESP_LIM_ANG_MIN_PREFIX):
+        payload = text[len(RESP_LIM_ANG_MIN_PREFIX):]
+        return ParsedResponse(kind="LIMANGMIN", payload=payload, raw=line)
 
     if text.startswith(RESP_LIM_Y_MAX_PREFIX):
         payload = text[len(RESP_LIM_Y_MAX_PREFIX):]
@@ -402,17 +420,18 @@ def parse_response(line: str) -> ParsedResponse:
         payload = text[len(RESP_LIM_ANG_MAX_PREFIX):]
         return ParsedResponse(kind="LIMANGMAX", payload=payload, raw=line)
 
-    if text.startswith(RESP_CAL_PROGRESS_PREFIX):
-        payload = text[len(RESP_CAL_PROGRESS_PREFIX):]
-        return ParsedResponse(kind="CAL_PROGRESS", payload=payload, raw=line)
-
     return ParsedResponse(kind="UNKNOWN", payload=None, raw=line)
 
 
 def parse_trajectory_progress(payload: str) -> TrajectoryPoint:
     """
     Parse the payload of a TRAJ_PROGRESS response ("<t>:<x>:<y>:<angle>")
-    into a TrajectoryPoint.
+    into a TrajectoryPoint. NOTE: since 2026-08-26, `x`/`y`/`angle` are
+    raw motor STEP counts, not cm/deg (see docs/protocol.md, Progreso
+    de ejecución) — reusing TrajectoryPoint here is just a convenient
+    4-number container, same caveat as Position (see its docstring);
+    `t` is unaffected (still real seconds). Callers needing cm/deg must
+    convert (see SystemStateMachine._on_progress).
 
     Args:
         payload: The ParsedResponse.payload of a "TRAJ_PROGRESS" response.
@@ -428,7 +447,11 @@ def parse_trajectory_progress(payload: str) -> TrajectoryPoint:
 def parse_position(payload: str) -> Position:
     """
     Parse the payload of a POSITION response ("<x>:<y>:<angle>") into a
-    Position.
+    Position. NOTE: since 2026-08-26 these fields are raw motor STEP
+    counts, not cm/deg (see docs/protocol.md, Consulta de Posición) —
+    reusing the Position dataclass here is just a convenient 3-float
+    container, not a claim that the values are in real units. Callers
+    needing cm/deg must convert (see SystemStateMachine.get_position()).
 
     Raises:
         ValueError: If the payload does not contain exactly 3 colon-
@@ -438,17 +461,3 @@ def parse_position(payload: str) -> Position:
     return Position(x=float(x), y=float(y), angle=float(angle))
 
 
-def parse_calibration_progress(payload: str):
-    """
-    Parse the payload of a CAL_PROGRESS response ("axis:value", colon-
-    separated — see docs/protocol.md, Calibration Events "Framing
-    exception") into an (axis, value) tuple. `axis` is one of "Y", "X",
-    "A"; `value` is the distance covered so far from that axis's min,
-    in real units.
-
-    Raises:
-        ValueError: If the payload does not contain exactly 2
-            colon-separated fields, or value is not numeric.
-    """
-    axis, value = payload.split(":")
-    return axis, float(value)

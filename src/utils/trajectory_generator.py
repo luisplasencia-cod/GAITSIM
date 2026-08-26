@@ -42,8 +42,8 @@ from src.utils.trajectory_validator import PositionOutOfRangeError, validate_pos
 # to compute how long each axis WOULD take on its own so the slowest
 # axis can set the shared total duration. Placeholders until the real
 # rig's motor speeds are known — same spirit as
-# SystemStateMachine.Y_LIFT_MARGIN_CM / ANGLE_HORIZONTAL_OFFSET_DEG,
-# not tied to any real mechanical measurement yet.
+# SystemStateMachine.Y_LIFT_MARGIN_CM, not tied to any real mechanical
+# measurement yet.
 SPEED_X_CM_S = 5.0
 SPEED_Y_CM_S = 5.0
 SPEED_ANGLE_DEG_S = 15.0

@@ -5,7 +5,7 @@ High-level interface to the ESP32, used directly by the UI layer.
 
 Combines protocol.py (message format) and serial_manager.py (transport)
 to expose simple, purpose-named methods: ping(), home(), move_manual(),
-send_trajectory(), run(), pause(), resume(), stop().
+send_trajectory(), run(), pause(), resume(), abort().
 
 Synchronization model:
     - Fast, deterministic commands (PING, HOME, MANUAL, trajectory
@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 from src.communication import protocol
-from src.communication.protocol import ParsedResponse, Position, TrajectoryPoint
+from src.communication.protocol import ParsedResponse, Position, TrajectoryPoint, TrajectoryStepDelta
 from src.communication.serial_manager import SerialManager, SerialManagerError
 
 
@@ -102,15 +102,15 @@ class ESP32Controller:
         self.on_resumed: Optional[Callable[[], None]] = None
         self.on_error: Optional[Callable[[str, str], None]] = None  # code, message
         self.on_disconnected: Optional[Callable[[], None]] = None
-        # axis ("Y"/"X"/"A"), bound ("MIN"/"MAX"), value (None for MIN —
-        # raw wire value, that axis's own limit switch IS its zero for
-        # all 3 axes; float for MAX) — see docs/protocol.md, Calibration
-        # Events. The angular axis's "relative to horizontal" offset is
-        # applied later, in SystemStateMachine, not here.
+        # axis ("Y"/"X"/"A"), bound ("MIN"/"MAX"), value: raw motor STEP
+        # COUNT, not cm/deg — None for Y/X's MIN (that axis's own limit
+        # switch IS raw step zero); for MAX (all axes) and for
+        # angular's MIN, a signed step count, since the angular axis's
+        # limit switches don't sit at level/horizontal (see
+        # docs/protocol.md, Calibration Events, "Cambio 2026-08-26
+        # (eje angular)"). The steps->cm/deg conversion is applied
+        # later, in SystemStateMachine, not here.
         self.on_calibration_limit: Optional[Callable[[str, str, Optional[float]], None]] = None
-        # axis ("Y"/"X"/"A"), value (distance covered so far from that
-        # axis's raw min, real units)
-        self.on_calibration_progress: Optional[Callable[[str, float], None]] = None
 
     # ------------------------------------------------------------------
     # Connection management
@@ -161,21 +161,6 @@ class ESP32Controller:
             protocol.build_home(), expected_kinds=["READY"], timeout=timeout
         )
 
-    def get_status(self, timeout: float = DEFAULT_TIMEOUT) -> str:
-        """
-        Query the current system state as reported by the ESP32.
-
-        Returns:
-            The state string (e.g. "IDLE", "RUNNING").
-
-        Raises:
-            TimeoutWaitingForResponseError: If no STATUS response arrives.
-        """
-        response = self._send_and_wait(
-            protocol.build_status_query(), expected_kinds=["STATUS"], timeout=timeout
-        )
-        return response.payload
-
     def move_manual(
         self, axis: str, direction: str, steps: int, timeout: float = DEFAULT_TIMEOUT
     ) -> None:
@@ -192,31 +177,16 @@ class ESP32Controller:
         message = protocol.build_manual_move(axis, direction, steps)
         self._send_and_wait(message, expected_kinds=["OK"], timeout=timeout)
 
-    def stop(self, timeout: float = DEFAULT_TIMEOUT) -> None:
-        """Immediately stop/pause motion (acts as an emergency stop)."""
-        self._send_and_wait(
-            protocol.build_stop(), expected_kinds=["STOPPED"], timeout=timeout
-        )
-
-    def go_to_position(self, position: Position, timeout: float = DEFAULT_TIMEOUT) -> None:
-        """
-        Move directly to an absolute (x, y, angle) position. Only valid
-        when the system is idle (not homing, not running) — the ESP32
-        itself enforces this, same as move_manual().
-
-        Raises:
-            DeviceReportedError: If the move is rejected (e.g. wrong state).
-            TimeoutWaitingForResponseError: If no response arrives.
-        """
-        message = protocol.build_goto_position(position)
-        self._send_and_wait(message, expected_kinds=["OK"], timeout=timeout)
-
     def get_position(self, timeout: float = DEFAULT_TIMEOUT) -> Position:
         """
-        Query the ESP32's current tracked (x, y, angle) position. This is
-        the only authoritative source for the real-unit result of a
-        step-based MANUAL move, since the Raspberry Pi does not itself
-        know any steps-to-units conversion.
+        Query the ESP32's current tracked (x, y, angle) position — a RAW
+        MOTOR STEP COUNT per axis, NOT cm/deg (see docs/protocol.md,
+        Consulta de Posición, "Cambio 2026-08-26" — same steps-not-real-
+        units treatment as the calibration sweep's LIM{AXIS}MAX).
+        Converting to cm/deg is SystemStateMachine.get_position()'s job
+        (STEPS_PER_CM_Y/STEPS_PER_CM_X/STEPS_PER_DEG_ANGLE), not this
+        method's — callers needing real units must go through that, not
+        this raw layer directly.
 
         Raises:
             TimeoutWaitingForResponseError: If no POSITION response arrives.
@@ -231,20 +201,26 @@ class ESP32Controller:
     # ------------------------------------------------------------------
 
     def send_trajectory(
-        self, points: List[TrajectoryPoint], timeout_per_point: float = DEFAULT_TIMEOUT
+        self, deltas: List[TrajectoryStepDelta], timeout_per_point: float = DEFAULT_TIMEOUT
     ) -> TrajectoryTransferResult:
         """
-        Send a full trajectory to the ESP32, point by point.
+        Send a full trajectory to the ESP32, delta by delta.
 
         This is a blocking, multi-step exchange: TRAJ_BEGIN, then one
-        TRAJ_POINT per point (each acknowledged individually), then
+        TRAJ_POINT per delta (each acknowledged individually), then
         TRAJ_END. If any step fails, the transfer stops immediately and
         the failure is reported in the returned result rather than
         raising — callers should check `.success` before proceeding to
         run().
 
         Args:
-            points: The trajectory points to send, in order.
+            deltas: The wire-level step deltas to send, in order — see
+                TrajectoryStepDelta in protocol.py. Callers holding
+                absolute cm/deg TrajectoryPoints (CSV-loaded or
+                generated) must convert first; this class has no unit-
+                conversion knowledge of its own (see
+                SystemStateMachine.send_trajectory(), the only real
+                caller, which does that conversion).
             timeout_per_point: Timeout, in seconds, for each individual
                 ACK while sending points.
 
@@ -253,7 +229,7 @@ class ESP32Controller:
         """
         try:
             self._send_and_wait(
-                protocol.build_trajectory_begin(len(points)),
+                protocol.build_trajectory_begin(len(deltas)),
                 expected_kinds=["TRAJ_READY"],
                 timeout=timeout_per_point,
             )
@@ -263,10 +239,10 @@ class ESP32Controller:
             )
 
         acknowledged = 0
-        for point in points:
+        for delta in deltas:
             try:
                 self._send_and_wait(
-                    protocol.build_trajectory_point(point),
+                    protocol.build_trajectory_step_point(delta),
                     expected_kinds=["ACK"],
                     timeout=timeout_per_point,
                 )
@@ -426,10 +402,6 @@ class ESP32Controller:
             value = float(response.payload) if response.payload is not None else None
             if self.on_calibration_limit is not None:
                 self.on_calibration_limit(axis, bound, value)
-        elif response.kind == "CAL_PROGRESS":
-            if self.on_calibration_progress is not None:
-                axis, value = protocol.parse_calibration_progress(response.payload)
-                self.on_calibration_progress(axis, value)
         # UNKNOWN or other kinds: silently ignored here; a future
         # logging module (see project roadmap) should record these
         # rather than the controller printing directly.

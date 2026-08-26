@@ -48,7 +48,10 @@ def make_state_machine():
     only the resulting CalibrationSpace matters for these checks."""
     controller = MagicMock(spec=ESP32Controller)
     controller.is_connected = True
-    controller.get_position.return_value = Position(x=5.0, y=5.0, angle=0.0)
+    # Raw motor steps (2026-08-26: GET_POSITION carries steps, not
+    # cm/deg — see docs/protocol.md, Consulta de Posición). 5cm/5cm/0deg
+    # equivalent, using SystemStateMachine.STEPS_PER_CM_X/Y (400/800).
+    controller.get_position.return_value = Position(x=2000.0, y=4000.0, angle=0.0)
     controller.send_trajectory.return_value = TrajectoryTransferResult(
         success=True, points_acknowledged=999
     )

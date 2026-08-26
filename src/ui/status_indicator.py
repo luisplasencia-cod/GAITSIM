@@ -69,6 +69,16 @@ class ConnectionStatusButton(QPushButton):
         if controller.is_connected:
             return  # pure indicator once connected — see module docstring
         controller.connect()
+        # Opening the serial port alone doesn't confirm there is a real,
+        # responsive ESP32 on the other end (wrong port, or a port that
+        # opens but has some other device on it) — PING/PONG is the
+        # actual connectivity check (2026-08-26, Luis's explicit
+        # request; docs/protocol.md, Comandos del Sistema).
+        if not controller.ping():
+            controller.disconnect()
+            self.setToolTip("El ESP32 no respondió al PING tras conectar.")
+            self._apply_state("ERROR")
+            return
         self._bridge.notify_connected()
 
     def _on_connected(self):

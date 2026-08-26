@@ -2,10 +2,10 @@
 Manual/offline verification for a new restriction in trajectory_screen.py:
 Run must stay blocked until a CSV has been loaded AND sent (Load &&
 Send) for the CURRENT initial position — closing a gap where, after
-setting up a new trial's position (first GOTO after HOME, or "Elegir
-Otro Ensayo" -> a new GOTO), Run stayed enabled even though no
-trajectory had ever been sent for that position (either none at all,
-or a stale one left over from a previous trial).
+setting up a new trial's position (first move to it after HOME, or
+"Elegir Otro Ensayo" -> a new position), Run stayed enabled even
+though no trajectory had ever been sent for that position (either none
+at all, or a stale one left over from a previous trial).
 
 Tracked via `_ensayo_sent_for_position` (see trajectory_screen.py's
 __init__): set to the position `_ensayo_trajectory` was last
@@ -51,6 +51,9 @@ def check(label: str, condition: bool):
 def make_state_machine():
     controller = MagicMock(spec=ESP32Controller)
     controller.is_connected = True
+    # Raw motor steps (2026-08-26: GET_POSITION carries steps, not
+    # cm/deg — see docs/protocol.md, Consulta de Posición). (0,0,0) is
+    # unaffected by the unit either way.
     controller.get_position.return_value = Position(x=0.0, y=0.0, angle=0.0)
     controller.send_trajectory.return_value = TrajectoryTransferResult(
         success=True, points_acknowledged=999

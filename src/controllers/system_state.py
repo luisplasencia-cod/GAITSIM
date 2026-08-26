@@ -23,7 +23,7 @@ from src.communication.esp32_controller import (
     ESP32Controller,
     TrajectoryTransferResult,
 )
-from src.communication.protocol import Position, TrajectoryPoint
+from src.communication.protocol import Position, TrajectoryPoint, TrajectoryStepDelta
 from src.communication.serial_manager import LOG_FILE, LineCappedFileHandler
 
 # Logs to the SAME file as serial_manager.py's wire-level log (interleaved
@@ -70,15 +70,15 @@ class CalibrationSpace:
     `y_min`/`x_min` are always 0.0 — for those axes, the min limit
     switch IS that axis's zero by definition, and the wire protocol
     itself is raw/limit-relative (see docs/protocol.md). `angle_min` is
-    DIFFERENT, but NOT at the wire level: `LIMANGMIN` is just as raw as
-    `LIMYMIN`/`LIMXMIN` on the wire. The angular axis is understood as
-    degrees relative to HORIZONTAL (0 deg = level), which is NOT the
-    same as "touching the limit switch" — there's a real physical
-    offset between the two. SystemStateMachine applies that offset
-    once, here, when reducing the raw sweep into this CalibrationSpace
-    (see ANGLE_HORIZONTAL_OFFSET_DEG and _build_calibration_space
-    below) — so `angle_min` ends up typically negative even though the
-    raw wire value it came from was 0.
+    DIFFERENT, and this time at the wire level too (since 2026-08-26):
+    the angular axis's limit switches don't sit at level/horizontal, so
+    the ESP32 itself reports `LIMANGMIN`/`LIMANGMAX` as signed step
+    counts already relative to horizontal = step 0 (e.g. -5000 at the
+    lower switch, 5400 at the upper one) instead of the RPi applying a
+    fixed offset afterward (see docs/protocol.md, Calibration Events,
+    "Cambio 2026-08-26 (eje angular)", and _build_calibration_space
+    below) — so `angle_min` ends up negative directly from the
+    firmware-reported value, no RPi-side correction involved.
     """
     y_min: float
     y_max: float
@@ -141,7 +141,6 @@ class SystemStateMachine:
         self.on_trajectory_finished: Optional[Callable[[], None]] = None
         self.on_trajectory_progress: Optional[Callable[[TrajectoryPoint], None]] = None
         self.on_calibration_limit: Optional[Callable[[str, str, Optional[float]], None]] = None
-        self.on_calibration_progress: Optional[Callable[[str, float], None]] = None
 
         # Result of the most recently completed HOME's limit-mapping
         # sweep (see CalibrationSpace) — None until the first HOME
@@ -159,7 +158,6 @@ class SystemStateMachine:
         self._controller.on_error = self._on_device_error
         self._controller.on_disconnected = self._on_disconnected
         self._controller.on_calibration_limit = self._on_calibration_limit
-        self._controller.on_calibration_progress = self._on_calibration_progress
 
     @property
     def state(self) -> SystemState:
@@ -320,7 +318,7 @@ class SystemStateMachine:
                 "generar una trayectoria de movimiento manual."
             )
 
-        current = self._controller.get_position()
+        current = self.get_position()
         if axis == "X" and abs(current.angle - self.ANGLE_REFERENCE_DEG) > self.ANGLE_REFERENCE_TOLERANCE_DEG:
             raise InvalidTransitionError(
                 f"No se puede mover X mientras el ángulo ({current.angle:g}°) "
@@ -347,16 +345,45 @@ class SystemStateMachine:
 
     def get_position(self) -> Position:
         """
-        Query the ESP32's current (x, y, angle) position. A read-only
-        query, allowed in any state — same spirit as a STATUS query.
+        Query the ESP32's current (x, y, angle) position, converted to
+        cm/deg. A read-only query, allowed in any state.
+
+        `ESP32Controller.get_position()` (the raw wire layer) returns
+        raw motor STEP counts, not cm/deg (see docs/protocol.md,
+        Consulta de Posición — same steps-not-real-units treatment
+        already applied to the calibration sweep's LIM{AXIS}MAX). This
+        method is the one place that conversion happens, using the
+        same STEPS_PER_CM_Y/STEPS_PER_CM_X/STEPS_PER_DEG_ANGLE
+        constants as _build_calibration_space — every other method in
+        this class that needs the current position (move_relative,
+        safe_return_to_position) MUST call this method, never
+        `self._controller.get_position()` directly, or it will treat
+        raw steps as if they were already cm/deg.
         """
-        return self._controller.get_position()
+        raw = self._controller.get_position()
+        return Position(
+            x=raw.x / self.STEPS_PER_CM_X,
+            y=raw.y / self.STEPS_PER_CM_Y,
+            angle=raw.angle / self.STEPS_PER_DEG_ANGLE,
+        )
 
     def send_trajectory(self, points: List[TrajectoryPoint]) -> TrajectoryTransferResult:
         """
         Transfer a trajectory to the ESP32. Transitions
         RECEIVING_TRAJECTORY -> IDLE regardless of success or failure
         (the caller must check the returned result).
+
+        `points` is absolute cm/deg/seconds, same as always (CSV-loaded
+        or generated) — this is the ONE place that converts it into the
+        signed step-delta wire format TRAJ_POINT now uses (see
+        _points_to_step_deltas, docs/protocol.md, "Cambio 2026-08-26
+        (trayectorias en pasos)") before handing it to
+        ESP32Controller.send_trajectory(), which has no unit-conversion
+        knowledge of its own. Applies to EVERY trajectory sent through
+        this method — CSV ensayos, the joystick's single-axis moves
+        (move_relative), the synchronized initial-position move, and
+        safe_return_to_position's 5-step sequence — since they all
+        funnel through here.
 
         Raises:
             InvalidTransitionError: If not currently idle.
@@ -366,9 +393,60 @@ class SystemStateMachine:
                 f"Cannot send trajectory while in state {self._state.name}."
             )
         self._set_state(SystemState.RECEIVING_TRAJECTORY)
-        result = self._controller.send_trajectory(points)
+        deltas = self._points_to_step_deltas(points)
+        result = self._controller.send_trajectory(deltas)
         self._set_state(SystemState.IDLE)
         return result
+
+    def _points_to_step_deltas(self, points: List[TrajectoryPoint]) -> List[TrajectoryStepDelta]:
+        """
+        Converts an absolute cm/deg/seconds TrajectoryPoint list into
+        the signed step-delta list TRAJ_POINT carries on the wire (see
+        docs/protocol.md, Comandos de Transferencia de Trayectoria,
+        "Cambio 2026-08-26 (trayectorias en pasos)").
+
+        Every point's delta (INCLUDING the first) is computed against
+        the platform's ACTUAL current position (self.get_position()),
+        never assumed to already match points[0] — this mirrors exactly
+        how the firmware itself accumulates (its running total starts
+        at its own tracked position when TRAJ_BEGIN arrives, see the
+        test firmware's handleTrajBegin()/trajAccumXSteps). Produces
+        exactly len(points) deltas — same count as before this change,
+        so TRAJ_BEGIN's n_points is unaffected.
+
+        Rounds each point's ABSOLUTE step position first, then takes
+        the difference between consecutive ROUNDED absolute values —
+        never rounds a delta independently — so rounding error never
+        accumulates across a long trajectory. Same technique the
+        teammate's own motion-data generation script uses for the
+        definitive firmware (round each absolute x/y/angle to steps
+        first, then diff consecutive rounded values for dx/dy/dk).
+        """
+        if not points:
+            return []
+
+        def to_steps(t_sec: float, x_cm: float, y_cm: float, angle_deg: float):
+            return (
+                round(t_sec * 1000),
+                round(x_cm * self.STEPS_PER_CM_X),
+                round(y_cm * self.STEPS_PER_CM_Y),
+                round(angle_deg * self.STEPS_PER_DEG_ANGLE),
+            )
+
+        current = self.get_position()
+        prev_t_ms, prev_x, prev_y, prev_a = to_steps(0.0, current.x, current.y, current.angle)
+
+        deltas = []
+        for point in points:
+            t_ms, x, y, a = to_steps(point.t, point.x, point.y, point.angle)
+            deltas.append(TrajectoryStepDelta(
+                dt_ms=t_ms - prev_t_ms,
+                dx_steps=x - prev_x,
+                dy_steps=y - prev_y,
+                dangle_steps=a - prev_a,
+            ))
+            prev_t_ms, prev_x, prev_y, prev_a = t_ms, x, y, a
+        return deltas
 
     def run(self) -> None:
         """
@@ -516,7 +594,7 @@ class SystemStateMachine:
         # locally at call time since by then both modules are fully loaded.
         from src.utils import trajectory_generator
 
-        current = self._controller.get_position()
+        current = self.get_position()
         points = trajectory_generator.generate_safe_return_trajectory(
             current,
             target,
@@ -583,23 +661,42 @@ class SystemStateMachine:
     def _on_progress(self, point: TrajectoryPoint) -> None:
         """
         Called when the ESP32 reports TRAJ_PROGRESS for a single point
-        during RUNNING. Does not change state — purely forwarded for
-        live plotting on the UI side.
+        during RUNNING. Does not change state.
+
+        `point.x`/`point.y`/`point.angle` arrive as raw motor steps
+        (see docs/protocol.md, Progreso de ejecución, "Cambio
+        2026-08-26") — converted to cm/deg here, the one place that
+        happens, before forwarding for live plotting on the UI side
+        (which expects cm/deg, unchanged by this). `point.t` is
+        untouched (already real seconds).
         """
         if self.on_trajectory_progress is not None:
-            self.on_trajectory_progress(point)
+            converted = TrajectoryPoint(
+                t=point.t,
+                x=point.x / self.STEPS_PER_CM_X,
+                y=point.y / self.STEPS_PER_CM_Y,
+                angle=point.angle / self.STEPS_PER_DEG_ANGLE,
+            )
+            self.on_trajectory_progress(converted)
 
     def _on_calibration_limit(self, axis: str, bound: str, value: Optional[float]) -> None:
         """
         Called for each LIM{AXIS}MIN/MAX event during a HOME's
-        limit-mapping sweep. Accumulates the RAW, wire-level values into
-        _calibration_data (all 3 axes uniformly: MIN carries no
-        argument, so `value` is None and defaults to 0.0). The final
-        CalibrationSpace is built once home() confirms READY, not here,
-        since a mid-sweep read could see a partially-filled map — that
-        is also where the angular axis's relative-to-horizontal offset
-        gets applied (see ANGLE_HORIZONTAL_OFFSET_DEG,
-        _build_calibration_space), NOT here.
+        limit-mapping sweep. Accumulates the RAW, wire-level step
+        counts (never cm/deg — see docs/protocol.md, Calibration
+        Events) into _calibration_data. Y/X's MIN carries no argument
+        (`value` is None, defaults to 0.0 — that axis's own limit
+        switch IS raw step zero); MAX (all axes) and angular's MIN
+        carry a signed step count as-is, since the angular axis's
+        limit switches don't sit at level/horizontal — the ESP32
+        itself reports steps already relative to horizontal = 0 for
+        that axis (see "Cambio 2026-08-26 (eje angular)"), so this
+        method does no axis-specific interpretation of its own. The
+        final CalibrationSpace is built once home() confirms READY,
+        not here, since a mid-sweep read could see a partially-filled
+        map — that is also where the steps->cm/deg conversion happens
+        (see STEPS_PER_CM_Y/STEPS_PER_CM_X/STEPS_PER_DEG_ANGLE,
+        _build_calibration_space).
         """
         data = self._calibration_data.setdefault(axis, {"min": 0.0, "max": 0.0})
         bound_key = "min" if bound == "MIN" else "max"
@@ -607,40 +704,48 @@ class SystemStateMachine:
         if self.on_calibration_limit is not None:
             self.on_calibration_limit(axis, bound, value)
 
-    def _on_calibration_progress(self, axis: str, value: float) -> None:
-        """Forwarded purely for live UI feedback during HOMING — does
-        not itself change _calibration_data (see _on_calibration_limit,
-        which uses each axis's authoritative LIM{AXIS}MAX value)."""
-        if self.on_calibration_progress is not None:
-            self.on_calibration_progress(axis, value)
+    # Real motor/mechanism constants (2026-08-26), from the teammate's
+    # definitive-firmware motion-data generation script — NOT
+    # arbitrary placeholders. They come from the actual leadscrew pitch
+    # (mm travelled per motor revolution), motor microstepping, and
+    # angular gearbox ratio of the real rig. Needed because the ESP32
+    # no longer converts LIM{AXIS}MAX to cm/deg itself — it reports raw
+    # steps and the RPi does the conversion (see docs/protocol.md,
+    # "Cambio 2026-08-26").
+    _LEADSCREW_X_MM_PER_REV = 10
+    _LEADSCREW_Y_MM_PER_REV = 5
+    _X_STEPS_PER_REV = 400
+    _Y_STEPS_PER_REV = 400
+    _K_STEPS_PER_REV = 800
+    _K_GEAR_RATIO = 50
 
-    # How many degrees the angular axis's raw wire-protocol zero
-    # (LIMANGMIN, i.e. "touching the min limit switch") sits BELOW true
-    # horizontal/level. Applied once, in _build_calibration_space(),
-    # to shift the raw [0, a_range] sweep reported by the wire protocol
-    # into a range relative to horizontal instead of relative to the
-    # limit switch (see CalibrationSpace's docstring and
-    # docs/protocol.md, Calibration Events). Placeholder until the real
-    # rig is calibrated — Luis's example value.
-    ANGLE_HORIZONTAL_OFFSET_DEG = -44.0
+    STEPS_PER_CM_X = (10 * _X_STEPS_PER_REV) / _LEADSCREW_X_MM_PER_REV
+    STEPS_PER_CM_Y = (10 * _Y_STEPS_PER_REV) / _LEADSCREW_Y_MM_PER_REV
+    STEPS_PER_DEG_ANGLE = (_K_GEAR_RATIO * _K_STEPS_PER_REV) / 360
 
     def _build_calibration_space(self) -> Optional[CalibrationSpace]:
-        """Reduces the 3 axes accumulated in _calibration_data into a
-        CalibrationSpace, or None if the sweep didn't report all 3
-        (e.g. an older firmware that only sends bare READY). Y/X pass
-        through as-is (their raw wire zero already IS their zero); the
-        angular axis gets ANGLE_HORIZONTAL_OFFSET_DEG added to both
-        bounds so it ends up relative to horizontal — the total range
-        (angle_max - angle_min) is unaffected by this constant shift."""
+        """Reduces the 3 axes accumulated in _calibration_data (raw
+        motor step counts) into a CalibrationSpace in cm/deg, or None
+        if the sweep didn't report all 3 (e.g. an older firmware that
+        only sends bare READY). All 3 axes are simply divided by their
+        STEPS_PER_CM_*/STEPS_PER_DEG_ANGLE constant — no offset is
+        applied here for the angular axis: since 2026-08-26 the ESP32
+        itself reports LIMANGMIN/LIMANGMAX as signed steps already
+        relative to horizontal = step 0 (see docs/protocol.md,
+        Calibration Events, "Cambio 2026-08-26 (eje angular)"), so
+        `a["min"]` is typically negative and `a["max"]` positive
+        already."""
         axes = ("Y", "X", "A")
         if not all(axis in self._calibration_data for axis in axes):
             return None
         y, x, a = (self._calibration_data[axis] for axis in axes)
         return CalibrationSpace(
-            y_min=y["min"], y_max=y["max"],
-            x_min=x["min"], x_max=x["max"],
-            angle_min=a["min"] + self.ANGLE_HORIZONTAL_OFFSET_DEG,
-            angle_max=a["max"] + self.ANGLE_HORIZONTAL_OFFSET_DEG,
+            y_min=y["min"] / self.STEPS_PER_CM_Y,
+            y_max=y["max"] / self.STEPS_PER_CM_Y,
+            x_min=x["min"] / self.STEPS_PER_CM_X,
+            x_max=x["max"] / self.STEPS_PER_CM_X,
+            angle_min=a["min"] / self.STEPS_PER_DEG_ANGLE,
+            angle_max=a["max"] / self.STEPS_PER_DEG_ANGLE,
         )
 
     def _on_device_error(self, code: str, message: str) -> None:

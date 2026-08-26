@@ -315,7 +315,6 @@ class ConnectionScreen(QWidget):
         self._bridge.device_error.connect(self._on_device_error)
         self._bridge.disconnected.connect(self._on_disconnected)
         self._bridge.calibration_limit.connect(self._on_calibration_limit)
-        self._bridge.calibration_progress.connect(self._on_calibration_progress)
         self._bridge.trajectory_finished.connect(self._on_trajectory_finished)
 
     # ------------------------------------------------------------------
@@ -344,14 +343,12 @@ class ConnectionScreen(QWidget):
     def _on_calibration_limit(self, axis: str, bound: str, value):
         label = _AXIS_LABELS_ES.get(axis, axis)
         which = "mínimo" if bound == "MIN" else "máximo"
-        suffix = f" ({value:.1f})" if value is not None else ""
+        # value is a raw motor step count for MAX (see docs/protocol.md,
+        # Calibration Events) — always an integer, so no decimal point.
+        suffix = f" ({value:.0f} pasos)" if value is not None else ""
         self.status_label.setText(
             f"Calibrando eje {label}: límite {which} alcanzado{suffix}."
         )
-
-    def _on_calibration_progress(self, axis: str, value: float):
-        label = _AXIS_LABELS_ES.get(axis, axis)
-        self.status_label.setText(f"Calibrando eje {label}... {value:.1f}")
 
     def _prompt_initial_position_setup(self):
         """

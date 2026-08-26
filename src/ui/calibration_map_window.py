@@ -14,7 +14,7 @@ that window's own calibration-bounds overlay is a separate, additive
 drawing on its own canvas, not a replacement for this one.
 
 Read-only: never sends commands, only reacts to StateMachineBridge
-signals (calibration_limit/calibration_progress while HOMING) and
+signals (calibration_limit while HOMING) and
 reads SystemStateMachine.last_calibration_space directly for its
 starting state — so opening this window after a calibration already
 completed this session still shows the right map immediately, not just
@@ -319,7 +319,6 @@ class CalibrationMapWindow(QWidget):
 
     def _connect_signals(self):
         self._bridge.calibration_limit.connect(self._on_calibration_limit)
-        self._bridge.calibration_progress.connect(self._on_calibration_progress)
         self._bridge.state_changed.connect(self._on_state_changed)
         self._bridge.trajectory_progress.connect(self._on_trajectory_progress)
 
@@ -334,7 +333,7 @@ class CalibrationMapWindow(QWidget):
         # HOME's limit-mapping sweep ends with the HOMING -> IDLE
         # transition — refresh from the state machine's freshly-computed
         # CalibrationSpace rather than trying to track completion via
-        # the individual LIM*/CAL_PROGRESS events themselves.
+        # the individual LIM* events themselves.
         if state_name == "IDLE":
             space = self._bridge.state_machine.last_calibration_space
             self._apply_space(space)
@@ -344,14 +343,12 @@ class CalibrationMapWindow(QWidget):
     def _on_calibration_limit(self, axis: str, bound: str, value):
         label = _AXIS_LABELS_ES.get(axis, axis)
         which = "mínimo" if bound == "MIN" else "máximo"
-        suffix = f" ({value:.1f})" if value is not None else ""
+        # value is a raw motor step count for MAX (see docs/protocol.md,
+        # Calibration Events) — always an integer, so no decimal point.
+        suffix = f" ({value:.0f} pasos)" if value is not None else ""
         self._status_label.setText(
             f"Calibrando eje {label}: límite {which} alcanzado{suffix}."
         )
-
-    def _on_calibration_progress(self, axis: str, value: float):
-        label = _AXIS_LABELS_ES.get(axis, axis)
-        self._status_label.setText(f"Calibrando eje {label}... {value:.1f}")
 
     def _on_trajectory_progress(self, t: float, x: float, y: float, angle: float):
         # Fed by ANY trajectory execution (the synchronized initial-

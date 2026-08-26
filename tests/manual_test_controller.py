@@ -35,8 +35,6 @@ def main():
     controller.home()
     print("Homed successfully.")
 
-    print("Status:", controller.get_status())
-
     # Small fake trajectory: 3 points, just to exercise the transfer.
     points = [
         TrajectoryPoint(t=0.0, x=0.0, y=0.0, angle=0.0),
