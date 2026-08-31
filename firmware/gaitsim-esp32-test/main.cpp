@@ -136,69 +136,47 @@ void handlePing() {
 // Real max step-count ceilings for Y/X (2026-08-26), from the
 // teammate's definitive-firmware motion-data generation script
 // (leadscrew pitch + motor microstepping of the real rig) — no longer
-// arbitrary placeholders like TEST_UNITS_PER_STEP above, since
-// LIM{AXIS}MAX now reports raw motor steps on the wire instead of the
-// ESP32 pre-converting to cm/deg (see docs/protocol.md, Calibration
-// Events, "Cambio 2026-08-26"). Y/X are raw/limit-relative: LIM*MIN is
-// that axis's zero (step 0), and LIM*MAX counts up from it.
+// arbitrary placeholders like TEST_UNITS_PER_STEP above, since HOME's
+// READY response now reports raw motor steps on the wire instead of
+// the ESP32 pre-converting to cm/deg (see docs/protocol.md,
+// Calibración, "Cambio 2026-08-26"). Y/X are raw/limit-relative: the
+// MIN limit switch is that axis's zero (step 0, not sent on the wire —
+// see "Cambio 2026-08-31 (READY con límites)"), and MAX counts up
+// from it.
 const long CAL_Y_MAX_STEPS = 72000;
 const long CAL_X_MAX_STEPS = 48000;
 
 // Angular axis limits (2026-08-26, "Cambio 2026-08-26 (eje angular)"):
 // UNLIKE Y/X, this axis's physical limit switches don't sit at
-// level/horizontal, so the ESP32 itself reports LIMANGMIN/LIMANGMAX as
-// SIGNED step counts already relative to horizontal = step 0, instead
-// of the Raspberry Pi applying a fixed offset afterward. These match
-// the teammate's HOMING_ZERO_MIN_K_STEPS/HOMING_ZERO_MAX_K_STEPS
-// (angular gearbox ratio + motor microstepping of the real rig).
+// level/horizontal, so the ESP32 itself reports both as SIGNED step
+// counts already relative to horizontal = step 0 (the amin/amax fields
+// of READY:xmax:ymax:amin:amax), instead of the Raspberry Pi applying
+// a fixed offset afterward. These match the teammate's
+// HOMING_ZERO_MIN_K_STEPS/HOMING_ZERO_MAX_K_STEPS (angular gearbox
+// ratio + motor microstepping of the real rig).
 const long CAL_ANG_MIN_STEPS = -5000;
 const long CAL_ANG_MAX_STEPS = 5400;
 
-// Simulated duration of the travel-to-max phase, per axis — no
-// intermediate progress is reported anymore (CAL_PROGRESS was removed
-// from the protocol by explicit request), this is purely so HOMING
-// takes a visible moment instead of resolving instantly.
-const unsigned long CAL_AXIS_DURATION_MS = 4000;
-
-// Runs one axis's MIN -> travel -> MAX sequence for Y/X, where MIN is
-// always step 0 (no argument on the wire).
-//   limLabel: the LIM{...} token infix, e.g. "Y", "X"
-//   maxSteps: full simulated travel for this axis, in raw motor steps
-//
-// Unlike every other outgoing response in this file, these calibration
-// events are wrapped in '<' '>'.
-void simulateAxisCalibration(const String &limLabel, long maxSteps) {
-  sendResponse("<LIM" + limLabel + "MIN>");
-  delay(CAL_AXIS_DURATION_MS);
-  sendResponse("<LIM" + limLabel + "MAX:" + String(maxSteps) + ">");
-}
-
-// Runs the angular axis's MIN -> travel -> MAX sequence. UNLIKE
-// simulateAxisCalibration() above, both MIN and MAX carry a signed
-// step value here, since this axis's zero is horizontal/level, not
-// "touching the lower limit switch" (see CAL_ANG_MIN_STEPS/
-// CAL_ANG_MAX_STEPS above).
-void simulateAngularCalibration(long minSteps, long maxSteps) {
-  sendResponse("<LIMANGMIN:" + String(minSteps) + ">");
-  delay(CAL_AXIS_DURATION_MS);
-  sendResponse("<LIMANGMAX:" + String(maxSteps) + ">");
-}
+// Simulated duration of the full 3-axis sweep — since 2026-08-31 (see
+// docs/protocol.md, "Cambio 2026-08-31 (READY con límites)") no
+// intermediate per-axis events are reported anymore, only a single
+// READY at the end; this delay is purely so HOMING still takes a
+// visible moment instead of resolving instantly (same total time as
+// the old 3 x 4000ms per-axis sweep).
+const unsigned long CAL_SWEEP_DURATION_MS = 12000;
 
 void handleHome() {
   currentState = STATE_HOMING;
 
-  // Full limit-mapping sweep, one axis at a time, in the order defined
-  // by docs/protocol.md's Calibration Events section (Y, then X, then
-  // Angular).
-  simulateAxisCalibration("Y", CAL_Y_MAX_STEPS);
-  simulateAxisCalibration("X", CAL_X_MAX_STEPS);
-  simulateAngularCalibration(CAL_ANG_MIN_STEPS, CAL_ANG_MAX_STEPS);
+  delay(CAL_SWEEP_DURATION_MS);
 
   posXSteps = 0;
   posYSteps = 0;
   posAngleSteps = 0;
   currentState = STATE_IDLE;
-  sendResponse("READY");
+  sendResponse(
+      "READY:" + String(CAL_X_MAX_STEPS) + ":" + String(CAL_Y_MAX_STEPS) +
+      ":" + String(CAL_ANG_MIN_STEPS) + ":" + String(CAL_ANG_MAX_STEPS));
 }
 
 void handleManual(const String &line) {

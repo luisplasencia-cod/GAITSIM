@@ -13,12 +13,12 @@ src/ui/platform_view.py) directly into trajectory_screen.py instead —
 that window's own calibration-bounds overlay is a separate, additive
 drawing on its own canvas, not a replacement for this one.
 
-Read-only: never sends commands, only reacts to StateMachineBridge
-signals (calibration_limit while HOMING) and
+Read-only: never sends commands, only reacts to StateMachineBridge's
+state_changed signal (to know when a HOME sweep starts/finishes) and
 reads SystemStateMachine.last_calibration_space directly for its
 starting state — so opening this window after a calibration already
 completed this session still shows the right map immediately, not just
-newly-arriving events.
+a newly-finished one.
 """
 
 import math
@@ -35,10 +35,6 @@ from src.ui.style import (
     COLOR_SURFACE_ALT, COLOR_TEXT_MUTED, COLOR_AXIS_X, COLOR_AXIS_Y,
     COLOR_AXIS_ANGLE, COLOR_ACCENT, FONT_SIZE_NORMAL, STATUS_COLORS,
 )
-
-# Spanish labels for calibration status messages, keyed by the axis
-# codes used throughout the protocol (Y/X/A — see docs/protocol.md).
-_AXIS_LABELS_ES = {"Y": "Y (vertical)", "X": "X (horizontal)", "A": "ángulo"}
 
 
 class CalibrationMapView(QWidget):
@@ -318,7 +314,6 @@ class CalibrationMapWindow(QWidget):
         self._angle_label.setStyleSheet(f"color: {COLOR_AXIS_ANGLE()}; font-weight: 600;")
 
     def _connect_signals(self):
-        self._bridge.calibration_limit.connect(self._on_calibration_limit)
         self._bridge.state_changed.connect(self._on_state_changed)
         self._bridge.trajectory_progress.connect(self._on_trajectory_progress)
 
@@ -332,23 +327,17 @@ class CalibrationMapWindow(QWidget):
     def _on_state_changed(self, state_name: str):
         # HOME's limit-mapping sweep ends with the HOMING -> IDLE
         # transition — refresh from the state machine's freshly-computed
-        # CalibrationSpace rather than trying to track completion via
-        # the individual LIM* events themselves.
-        if state_name == "IDLE":
+        # CalibrationSpace at that point. Since 2026-08-31 there are no
+        # more intermediate per-axis events during the sweep (see
+        # docs/protocol.md, "Cambio 2026-08-31 (READY con límites)"), so
+        # HOMING itself just shows one generic status message.
+        if state_name == "HOMING":
+            self._status_label.setText("Calibrando...")
+        elif state_name == "IDLE":
             space = self._bridge.state_machine.last_calibration_space
             self._apply_space(space)
             if space is not None:
                 self._status_label.setText("Calibración completada.")
-
-    def _on_calibration_limit(self, axis: str, bound: str, value):
-        label = _AXIS_LABELS_ES.get(axis, axis)
-        which = "mínimo" if bound == "MIN" else "máximo"
-        # value is a raw motor step count for MAX (see docs/protocol.md,
-        # Calibration Events) — always an integer, so no decimal point.
-        suffix = f" ({value:.0f} pasos)" if value is not None else ""
-        self._status_label.setText(
-            f"Calibrando eje {label}: límite {which} alcanzado{suffix}."
-        )
 
     def _on_trajectory_progress(self, t: float, x: float, y: float, angle: float):
         # Fed by ANY trajectory execution (the synchronized initial-

@@ -1,22 +1,20 @@
 """
-Manual/offline verification for the 2026-08-26 calibration protocol
-changes (see docs/protocol.md, Calibration Events):
+Manual/offline verification for the 2026-08-31 calibration protocol
+change (see docs/protocol.md, Calibración, "Cambio 2026-08-31 (READY
+con límites)"):
 
-  1. LIM{AXIS}MAX reports a raw motor step count instead of a value
-     already converted to cm/deg by the ESP32, and CAL_PROGRESS was
-     removed entirely ("Cambio 2026-08-26").
-  2. The angular axis is special-cased ("Cambio 2026-08-26 (eje
-     angular)"): LIMANGMIN now ALSO carries a signed step count (unlike
-     Y/X's argument-less MIN), because the ESP32 itself reports steps
-     already relative to horizontal = step 0 instead of the Raspberry
-     Pi applying a fixed offset (ANGLE_HORIZONTAL_OFFSET_DEG, now
-     removed) afterward.
+  HOME's response collapsed from 6 live LIM{AXIS}MIN/MAX events (2026-
+  08-26 wire format) + a bare READY into a single
+  "READY:xmax:ymax:amin:amax" line — no more intermediate events, no
+  more '<' '>' framing exception for calibration events.
 
-Checks that SystemStateMachine converts raw steps into the
-CalibrationSpace's cm/deg using the real rig constants
-(STEPS_PER_CM_Y/STEPS_PER_CM_X/STEPS_PER_DEG_ANGLE), that Y/X min stays
-0 while angular min can be negative, and that CAL_PROGRESS /
-ANGLE_HORIZONTAL_OFFSET_DEG are both gone from the code.
+Checks that protocol.parse_response()/parse_home_limits() handle the
+new READY payload, that SystemStateMachine._build_calibration_space()
+converts the resulting HomeLimits into cm/deg using the real rig
+constants (STEPS_PER_CM_Y/STEPS_PER_CM_X/STEPS_PER_DEG_ANGLE) with Y/X
+min staying 0 while angular min can be negative, and that the old
+per-event machinery (LIM* constants, CALIBRATION_LIMIT_KINDS,
+on_calibration_limit) is gone from the code.
 
 Uses a mocked ESP32Controller — no real hardware/serial connection
 needed — same spirit as the mocked-controller verification already
@@ -30,7 +28,7 @@ from unittest.mock import MagicMock
 
 from src.communication import protocol
 from src.communication.esp32_controller import ESP32Controller
-from src.controllers.system_state import SystemState, SystemStateMachine
+from src.controllers.system_state import SystemStateMachine
 
 _failures = 0
 
@@ -51,22 +49,26 @@ def main():
     controller = MagicMock(spec=ESP32Controller)
     controller.is_connected = True
     sm = SystemStateMachine(controller)
-    sm._homed = False
-    sm._state = SystemState.HOMING
 
     # Real physical step values supplied by the teammate for the
     # definitive firmware's rig (see docs/protocol.md): Y up to 72000
     # steps, X up to 48000 steps, Angular from -5000 (lower limit
     # switch) to 5400 (upper limit switch), signed relative to
     # horizontal = step 0.
-    sm._on_calibration_limit("Y", "MIN", None)
-    sm._on_calibration_limit("Y", "MAX", 72000.0)
-    sm._on_calibration_limit("X", "MIN", None)
-    sm._on_calibration_limit("X", "MAX", 48000.0)
-    sm._on_calibration_limit("A", "MIN", -5000.0)
-    sm._on_calibration_limit("A", "MAX", 5400.0)
+    parsed = protocol.parse_response("READY:48000:72000:-5000:5400")
+    check("READY parses with kind='READY'", parsed.kind == "READY")
+    check(
+        "READY payload is the raw 'xmax:ymax:amin:amax' text",
+        parsed.payload == "48000:72000:-5000:5400",
+    )
 
-    space = sm._build_calibration_space()
+    limits = protocol.parse_home_limits(parsed.payload)
+    check("parse_home_limits reads x_max=48000", limits.x_max == 48000.0)
+    check("parse_home_limits reads y_max=72000", limits.y_max == 72000.0)
+    check("parse_home_limits reads angle_min=-5000", limits.angle_min == -5000.0)
+    check("parse_home_limits reads angle_max=5400", limits.angle_max == 5400.0)
+
+    space = sm._build_calibration_space(limits)
 
     check("Y range converts 72000 steps -> 90.0 cm", approx(space.y_range, 90.0))
     check("X range converts 48000 steps -> 120.0 cm", approx(space.x_range, 120.0))
@@ -86,37 +88,23 @@ def main():
     )
     check("Y min stays 0.0 (raw wire zero IS the axis zero)", space.y_min == 0.0)
     check("X min stays 0.0 (raw wire zero IS the axis zero)", space.x_min == 0.0)
-    check(
-        "ANGLE_HORIZONTAL_OFFSET_DEG was removed from SystemStateMachine",
-        not hasattr(sm, "ANGLE_HORIZONTAL_OFFSET_DEG"),
-    )
 
-    # CAL_PROGRESS must no longer exist on the wire parser at all.
-    parsed = protocol.parse_response("<CAL_PROGRESS:Y:15.0000>")
-    check("CAL_PROGRESS is no longer parsed (falls back to UNKNOWN)", parsed.kind == "UNKNOWN")
+    # The old per-event LIM* machinery must be gone entirely — a stray
+    # "<LIM...>" line from an out-of-date firmware should now fall back
+    # to UNKNOWN, same as any other unrecognized line, instead of being
+    # specially unwrapped.
+    parsed_lim = protocol.parse_response("<LIMYMAX:72000>")
     check(
-        "parse_calibration_progress() was removed from protocol.py",
-        not hasattr(protocol, "parse_calibration_progress"),
+        "Old-style <LIM...> events are no longer recognized (fall back to UNKNOWN)",
+        parsed_lim.kind == "UNKNOWN",
     )
     check(
-        "SystemStateMachine no longer exposes on_calibration_progress",
-        not hasattr(sm, "on_calibration_progress"),
+        "CALIBRATION_LIMIT_KINDS was removed from protocol.py",
+        not hasattr(protocol, "CALIBRATION_LIMIT_KINDS"),
     )
-
-    # LIM{AXIS}MAX still parses fine as a plain integer-valued payload.
-    parsed_max = protocol.parse_response("<LIMYMAX:72000>")
-    check("LIMYMAX still parses correctly", parsed_max.kind == "LIMYMAX" and parsed_max.payload == "72000")
-
-    # LIMANGMIN now carries a signed argument too (unlike LIMYMIN/LIMXMIN).
-    parsed_angmin = protocol.parse_response("<LIMANGMIN:-5000>")
     check(
-        "LIMANGMIN now parses WITH a payload (unlike LIMYMIN/LIMXMIN)",
-        parsed_angmin.kind == "LIMANGMIN" and parsed_angmin.payload == "-5000",
-    )
-    parsed_ymin = protocol.parse_response("<LIMYMIN>")
-    check(
-        "LIMYMIN still parses with no payload",
-        parsed_ymin.kind == "LIMYMIN" and parsed_ymin.payload is None,
+        "SystemStateMachine no longer exposes on_calibration_limit",
+        not hasattr(sm, "on_calibration_limit"),
     )
 
     if _failures:

@@ -17,13 +17,13 @@ import logging
 import threading
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Callable, Dict, List, Optional
+from typing import Callable, List, Optional
 
 from src.communication.esp32_controller import (
     ESP32Controller,
     TrajectoryTransferResult,
 )
-from src.communication.protocol import Position, TrajectoryPoint, TrajectoryStepDelta
+from src.communication.protocol import HomeLimits, Position, TrajectoryPoint, TrajectoryStepDelta
 from src.communication.serial_manager import LOG_FILE, LineCappedFileHandler
 
 # Logs to the SAME file as serial_manager.py's wire-level log (interleaved
@@ -72,11 +72,12 @@ class CalibrationSpace:
     itself is raw/limit-relative (see docs/protocol.md). `angle_min` is
     DIFFERENT, and this time at the wire level too (since 2026-08-26):
     the angular axis's limit switches don't sit at level/horizontal, so
-    the ESP32 itself reports `LIMANGMIN`/`LIMANGMAX` as signed step
-    counts already relative to horizontal = step 0 (e.g. -5000 at the
-    lower switch, 5400 at the upper one) instead of the RPi applying a
-    fixed offset afterward (see docs/protocol.md, Calibration Events,
-    "Cambio 2026-08-26 (eje angular)", and _build_calibration_space
+    the ESP32 itself reports `angle_min`/`angle_max` (the `amin`/`amax`
+    fields of HOME's `READY:xmax:ymax:amin:amax` response — see
+    docs/protocol.md, "Cambio 2026-08-31 (READY con límites)") as
+    signed step counts already relative to horizontal = step 0 (e.g.
+    -5000 at the lower switch, 5400 at the upper one) instead of the
+    RPi applying a fixed offset afterward (see _build_calibration_space
     below) — so `angle_min` ends up negative directly from the
     firmware-reported value, no RPi-side correction involved.
     """
@@ -140,15 +141,14 @@ class SystemStateMachine:
         self.on_state_changed: Optional[Callable[[SystemState], None]] = None
         self.on_trajectory_finished: Optional[Callable[[], None]] = None
         self.on_trajectory_progress: Optional[Callable[[TrajectoryPoint], None]] = None
-        self.on_calibration_limit: Optional[Callable[[str, str, Optional[float]], None]] = None
 
         # Result of the most recently completed HOME's limit-mapping
         # sweep (see CalibrationSpace) — None until the first HOME
-        # succeeds this session. Accumulated per-axis in
-        # _calibration_data while HOMING, then reduced into
-        # last_calibration_space once all 3 axes report both limits.
+        # succeeds this session. Built directly from the HomeLimits
+        # ESP32Controller.home() returns (see home() below) — since
+        # 2026-08-31 that's a single "READY:xmax:ymax:amin:amax"
+        # response, not events accumulated during the sweep.
         self.last_calibration_space: Optional[CalibrationSpace] = None
-        self._calibration_data: Dict[str, Dict[str, float]] = {}
 
         # Subscribe to the controller's asynchronous events so the
         # state machine reacts to things that happen without the UI
@@ -157,7 +157,6 @@ class SystemStateMachine:
         self._controller.on_trajectory_progress = self._on_progress
         self._controller.on_error = self._on_device_error
         self._controller.on_disconnected = self._on_disconnected
-        self._controller.on_calibration_limit = self._on_calibration_limit
 
     @property
     def state(self) -> SystemState:
@@ -227,14 +226,13 @@ class SystemStateMachine:
             )
         previous_state = self._state
         self._set_state(SystemState.HOMING)
-        self._calibration_data = {}
         try:
-            self._controller.home()
+            limits = self._controller.home()
         except Exception:
             self._set_state(previous_state)
             raise
         self._homed = True
-        self.last_calibration_space = self._build_calibration_space()
+        self.last_calibration_space = self._build_calibration_space(limits)
         self._set_state(SystemState.IDLE)
 
     def move_manual(self, axis: str, direction: str, steps: int) -> None:
@@ -679,31 +677,6 @@ class SystemStateMachine:
             )
             self.on_trajectory_progress(converted)
 
-    def _on_calibration_limit(self, axis: str, bound: str, value: Optional[float]) -> None:
-        """
-        Called for each LIM{AXIS}MIN/MAX event during a HOME's
-        limit-mapping sweep. Accumulates the RAW, wire-level step
-        counts (never cm/deg — see docs/protocol.md, Calibration
-        Events) into _calibration_data. Y/X's MIN carries no argument
-        (`value` is None, defaults to 0.0 — that axis's own limit
-        switch IS raw step zero); MAX (all axes) and angular's MIN
-        carry a signed step count as-is, since the angular axis's
-        limit switches don't sit at level/horizontal — the ESP32
-        itself reports steps already relative to horizontal = 0 for
-        that axis (see "Cambio 2026-08-26 (eje angular)"), so this
-        method does no axis-specific interpretation of its own. The
-        final CalibrationSpace is built once home() confirms READY,
-        not here, since a mid-sweep read could see a partially-filled
-        map — that is also where the steps->cm/deg conversion happens
-        (see STEPS_PER_CM_Y/STEPS_PER_CM_X/STEPS_PER_DEG_ANGLE,
-        _build_calibration_space).
-        """
-        data = self._calibration_data.setdefault(axis, {"min": 0.0, "max": 0.0})
-        bound_key = "min" if bound == "MIN" else "max"
-        data[bound_key] = value if value is not None else data[bound_key]
-        if self.on_calibration_limit is not None:
-            self.on_calibration_limit(axis, bound, value)
-
     # Real motor/mechanism constants (2026-08-26), from the teammate's
     # definitive-firmware motion-data generation script — NOT
     # arbitrary placeholders. They come from the actual leadscrew pitch
@@ -723,29 +696,24 @@ class SystemStateMachine:
     STEPS_PER_CM_Y = (10 * _Y_STEPS_PER_REV) / _LEADSCREW_Y_MM_PER_REV
     STEPS_PER_DEG_ANGLE = (_K_GEAR_RATIO * _K_STEPS_PER_REV) / 360
 
-    def _build_calibration_space(self) -> Optional[CalibrationSpace]:
-        """Reduces the 3 axes accumulated in _calibration_data (raw
-        motor step counts) into a CalibrationSpace in cm/deg, or None
-        if the sweep didn't report all 3 (e.g. an older firmware that
-        only sends bare READY). All 3 axes are simply divided by their
-        STEPS_PER_CM_*/STEPS_PER_DEG_ANGLE constant — no offset is
-        applied here for the angular axis: since 2026-08-26 the ESP32
-        itself reports LIMANGMIN/LIMANGMAX as signed steps already
-        relative to horizontal = step 0 (see docs/protocol.md,
-        Calibration Events, "Cambio 2026-08-26 (eje angular)"), so
-        `a["min"]` is typically negative and `a["max"]` positive
-        already."""
-        axes = ("Y", "X", "A")
-        if not all(axis in self._calibration_data for axis in axes):
-            return None
-        y, x, a = (self._calibration_data[axis] for axis in axes)
+    def _build_calibration_space(self, limits: HomeLimits) -> CalibrationSpace:
+        """Converts a HOME's raw-step HomeLimits (from
+        ESP32Controller.home()'s "READY:xmax:ymax:amin:amax" response)
+        into a CalibrationSpace in cm/deg. y_min/x_min are always 0.0 —
+        those axes' own limit switch IS raw step zero by definition, so
+        the wire payload doesn't carry them at all. No offset is applied
+        for the angular axis: the ESP32 itself reports angle_min/
+        angle_max as signed steps already relative to horizontal = step
+        0 (see docs/protocol.md, Calibración, "Cambio 2026-08-26 (eje
+        angular)"), so `limits.angle_min` is typically negative and
+        `limits.angle_max` positive already."""
         return CalibrationSpace(
-            y_min=y["min"] / self.STEPS_PER_CM_Y,
-            y_max=y["max"] / self.STEPS_PER_CM_Y,
-            x_min=x["min"] / self.STEPS_PER_CM_X,
-            x_max=x["max"] / self.STEPS_PER_CM_X,
-            angle_min=a["min"] / self.STEPS_PER_DEG_ANGLE,
-            angle_max=a["max"] / self.STEPS_PER_DEG_ANGLE,
+            y_min=0.0,
+            y_max=limits.y_max / self.STEPS_PER_CM_Y,
+            x_min=0.0,
+            x_max=limits.x_max / self.STEPS_PER_CM_X,
+            angle_min=limits.angle_min / self.STEPS_PER_DEG_ANGLE,
+            angle_max=limits.angle_max / self.STEPS_PER_DEG_ANGLE,
         )
 
     def _on_device_error(self, code: str, message: str) -> None:

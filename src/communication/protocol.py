@@ -64,7 +64,6 @@ CMD_GET_POSITION = "GET_POSITION"
 # ---------------------------------------------------------------------------
 
 RESP_PONG = "PONG"
-RESP_READY = "READY"
 RESP_OK = "OK"
 RESP_TRAJ_READY = "TRAJ_READY"
 RESP_TRAJ_STORED = "TRAJ_STORED"
@@ -78,49 +77,18 @@ RESP_ERROR_PREFIX = "ERROR:"
 RESP_TRAJ_PROGRESS_PREFIX = "TRAJ_PROGRESS:"
 RESP_POSITION_PREFIX = "POSITION:"
 
-# Calibration events (unsolicited, during HOMING) — see docs/protocol.md,
-# "Calibration Events" section. On the wire these arrive wrapped in
-# '<' '>' (e.g. "<LIMYMIN>", "<LIMYMAX:72000>") — the constants below
-# are matched against the ALREADY-UNWRAPPED text (parse_response()
-# strips the framing before any comparison happens). MAX always carries
-# the raw motor STEP COUNT at that axis's max limit switch as its one
-# argument (NOT cm/deg — see docs/protocol.md, "Cambio 2026-08-26").
-# This is the one ESP32 -> RPi exception to the "responses are
-# unframed" rule (see Transport in docs/protocol.md).
-#
-# Y/X MIN carry no argument (that axis's min limit switch IS raw step
-# zero). The angular axis is DIFFERENT since 2026-08-26 (see
-# docs/protocol.md, "Cambio 2026-08-26 (eje angular)"): its physical
-# limit switches don't sit at "level/horizontal", so the ESP32 itself
-# reports LIMANGMIN/LIMANGMAX as SIGNED step counts already relative to
-# horizontal = step 0 (e.g. -5000 at the lower switch, 5400 at the
-# upper one) instead of the RPi applying a fixed offset afterward. This
-# is the one place the 3 axes are NOT wire-uniform.
-#
-# The steps->cm/deg conversion itself is a pure RPi-side business-logic
-# concern, NOT a wire-format one — see SystemStateMachine.STEPS_PER_CM_Y/
-# STEPS_PER_CM_X/STEPS_PER_DEG_ANGLE in system_state.py. protocol.py
-# stays hardware/business-logic-agnostic (see module docstring) and
-# reports the raw step counts exactly as sent.
-RESP_LIM_Y_MIN = "LIMYMIN"
-RESP_LIM_X_MIN = "LIMXMIN"
-RESP_LIM_ANG_MIN_PREFIX = "LIMANGMIN:"
-
-RESP_LIM_Y_MAX_PREFIX = "LIMYMAX:"
-RESP_LIM_X_MAX_PREFIX = "LIMXMAX:"
-RESP_LIM_ANG_MAX_PREFIX = "LIMANGMAX:"
-
-# Maps a ParsedResponse.kind to (axis, bound) for every calibration
-# limit event, so callers don't need to know the wire tokens themselves
-# (esp32_controller.py's dispatch uses this).
-CALIBRATION_LIMIT_KINDS = {
-    "LIMYMIN": ("Y", "MIN"),
-    "LIMXMIN": ("X", "MIN"),
-    "LIMANGMIN": ("A", "MIN"),
-    "LIMYMAX": ("Y", "MAX"),
-    "LIMXMAX": ("X", "MAX"),
-    "LIMANGMAX": ("A", "MAX"),
-}
+# HOME's response (2026-08-31, "Cambio 2026-08-31 (READY con límites)"):
+# the ESP32 no longer streams 6 separate <LIM*MIN/MAX> events during the
+# limit-mapping sweep — it reports the 4 values it doesn't already know
+# to be 0 (Y/X's MIN, by definition, IS raw step zero for those axes) in
+# a single READY line: "READY:xmax_steps:ymax_steps:amin_steps:amax_steps".
+# All 4 are raw motor STEP counts (NOT cm/deg — see docs/protocol.md,
+# "Cambio 2026-08-26"); angular's amin/amax are SIGNED, already relative
+# to horizontal = step 0 (its limit switches don't sit at level), same
+# convention as before. This IS a normal unframed response now — there
+# is no more "responses are unframed except calibration events"
+# exception (see Transport in docs/protocol.md).
+RESP_READY_PREFIX = "READY:"
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +176,24 @@ class Position:
 
 
 @dataclass
+class HomeLimits:
+    """
+    The 4 raw step values reported by a completed HOME
+    ("READY:xmax:ymax:amin:amax" — see RESP_READY_PREFIX above). Y/X's
+    MIN is not part of this: it is always 0 by definition (that axis's
+    own limit switch IS raw step zero), so only their MAX travels.
+    Angular's `angle_min`/`angle_max` are signed, already relative to
+    horizontal = step 0. Units: raw motor steps, NOT cm/deg — converting
+    is SystemStateMachine's job (see CalibrationSpace/
+    _build_calibration_space in system_state.py), not this layer's.
+    """
+    x_max: float
+    y_max: float
+    angle_min: float
+    angle_max: float
+
+
+@dataclass
 class ParsedResponse:
     """
     Result of parsing a single line received from the ESP32.
@@ -215,13 +201,12 @@ class ParsedResponse:
     Attributes:
         kind: One of "OK", "ERROR", "ACK", "READY", "PONG", "RUNNING",
               "FINISHED", "PAUSED", "ABORTED", "TRAJ_READY",
-              "TRAJ_STORED", "TRAJ_PROGRESS", "POSITION", "LIMYMIN",
-              "LIMXMIN", "LIMANGMIN", "LIMYMAX", "LIMXMAX",
-              "LIMANGMAX" (see CALIBRATION_LIMIT_KINDS), or "UNKNOWN" if
-              the line did not match any known response format.
+              "TRAJ_STORED", "TRAJ_PROGRESS", "POSITION", or "UNKNOWN"
+              if the line did not match any known response format.
         payload: Additional data extracted from the line, when applicable
-                 (e.g. the status string, the ACK index, or the error
-                 code/message). None if not applicable.
+                 (e.g. the status string, the ACK index, the error
+                 code/message, or READY's "xmax:ymax:amin:amax" — see
+                 parse_home_limits()). None if not applicable.
         raw: The original line, unmodified, for logging/debugging.
     """
     kind: str
@@ -239,7 +224,11 @@ def build_ping() -> str:
 
 
 def build_home() -> str:
-    """Build a HOME command frame (triggers homing + limit mapping)."""
+    """
+    Build a HOME command frame (triggers homing + limit mapping).
+    Response is "READY:xmax:ymax:amin:amax" — see RESP_READY_PREFIX and
+    parse_home_limits().
+    """
     return f"<{CMD_HOME}>"
 
 
@@ -356,18 +345,8 @@ def parse_response(line: str) -> ParsedResponse:
     """
     text = line.strip()
 
-    # Calibration events (LIM*MIN/MAX) are, by explicit request, the
-    # only ESP32 -> RPi messages framed with '<' '>' (see
-    # docs/protocol.md, Calibration Events "Framing exception") — every
-    # other response matched below is unframed, so this strip is a
-    # no-op for all of them (none start/end with '<'/'>').
-    if text.startswith("<") and text.endswith(">"):
-        text = text[1:-1]
-
     if text == RESP_PONG:
         return ParsedResponse(kind="PONG", payload=None, raw=line)
-    if text == RESP_READY:
-        return ParsedResponse(kind="READY", payload=None, raw=line)
     if text == RESP_OK:
         return ParsedResponse(kind="OK", payload=None, raw=line)
     if text == RESP_TRAJ_READY:
@@ -402,23 +381,9 @@ def parse_response(line: str) -> ParsedResponse:
         payload = text[len(RESP_POSITION_PREFIX):]
         return ParsedResponse(kind="POSITION", payload=payload, raw=line)
 
-    if text == RESP_LIM_Y_MIN:
-        return ParsedResponse(kind="LIMYMIN", payload=None, raw=line)
-    if text == RESP_LIM_X_MIN:
-        return ParsedResponse(kind="LIMXMIN", payload=None, raw=line)
-    if text.startswith(RESP_LIM_ANG_MIN_PREFIX):
-        payload = text[len(RESP_LIM_ANG_MIN_PREFIX):]
-        return ParsedResponse(kind="LIMANGMIN", payload=payload, raw=line)
-
-    if text.startswith(RESP_LIM_Y_MAX_PREFIX):
-        payload = text[len(RESP_LIM_Y_MAX_PREFIX):]
-        return ParsedResponse(kind="LIMYMAX", payload=payload, raw=line)
-    if text.startswith(RESP_LIM_X_MAX_PREFIX):
-        payload = text[len(RESP_LIM_X_MAX_PREFIX):]
-        return ParsedResponse(kind="LIMXMAX", payload=payload, raw=line)
-    if text.startswith(RESP_LIM_ANG_MAX_PREFIX):
-        payload = text[len(RESP_LIM_ANG_MAX_PREFIX):]
-        return ParsedResponse(kind="LIMANGMAX", payload=payload, raw=line)
+    if text.startswith(RESP_READY_PREFIX):
+        payload = text[len(RESP_READY_PREFIX):]
+        return ParsedResponse(kind="READY", payload=payload, raw=line)
 
     return ParsedResponse(kind="UNKNOWN", payload=None, raw=line)
 
@@ -459,5 +424,25 @@ def parse_position(payload: str) -> Position:
     """
     x, y, angle = payload.split(":")
     return Position(x=float(x), y=float(y), angle=float(angle))
+
+
+def parse_home_limits(payload: str) -> HomeLimits:
+    """
+    Parse the payload of a READY response ("xmax:ymax:amin:amax") into
+    a HomeLimits. All 4 fields are raw motor step counts (see
+    HomeLimits' docstring) — Y/X's MIN is not part of the wire payload
+    at all, since it's always 0 by definition.
+
+    Raises:
+        ValueError: If the payload does not contain exactly 4 colon-
+            separated numeric fields.
+    """
+    x_max, y_max, angle_min, angle_max = payload.split(":")
+    return HomeLimits(
+        x_max=float(x_max),
+        y_max=float(y_max),
+        angle_min=float(angle_min),
+        angle_max=float(angle_max),
+    )
 
 

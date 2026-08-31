@@ -42,13 +42,6 @@ from src.ui.limit_violation_dialog import LimitViolationDialog
 from src.utils import position_library, trajectory_generator
 from src.utils.trajectory_validator import PositionOutOfRangeError, check_position
 
-# Spanish labels for calibration status messages, keyed by the axis
-# codes used throughout the protocol (Y/X/A — see docs/protocol.md).
-# The resulting movement-space MAP is drawn in a separate window (see
-# calibration_map_window.py) — this screen only shows live text status
-# while HOMING is in progress.
-_AXIS_LABELS_ES = {"Y": "Y (vertical)", "X": "X (horizontal)", "A": "ángulo"}
-
 
 class _AutoFitLabel(QLabel):
     """
@@ -314,7 +307,6 @@ class ConnectionScreen(QWidget):
         self._bridge.connected.connect(self._on_connected)
         self._bridge.device_error.connect(self._on_device_error)
         self._bridge.disconnected.connect(self._on_disconnected)
-        self._bridge.calibration_limit.connect(self._on_calibration_limit)
         self._bridge.trajectory_finished.connect(self._on_trajectory_finished)
 
     # ------------------------------------------------------------------
@@ -338,16 +330,6 @@ class ConnectionScreen(QWidget):
             self._bridge.state_machine.home,
             success_message="Calibración completada.",
             on_success=self._prompt_initial_position_setup,
-        )
-
-    def _on_calibration_limit(self, axis: str, bound: str, value):
-        label = _AXIS_LABELS_ES.get(axis, axis)
-        which = "mínimo" if bound == "MIN" else "máximo"
-        # value is a raw motor step count for MAX (see docs/protocol.md,
-        # Calibration Events) — always an integer, so no decimal point.
-        suffix = f" ({value:.0f} pasos)" if value is not None else ""
-        self.status_label.setText(
-            f"Calibrando eje {label}: límite {which} alcanzado{suffix}."
         )
 
     def _prompt_initial_position_setup(self):
@@ -596,7 +578,14 @@ class ConnectionScreen(QWidget):
     # ------------------------------------------------------------------
 
     def _on_state_changed(self, state_name: str):
-        self.status_label.setText(state_name)
+        # HOME no longer streams per-axis progress (see docs/protocol.md,
+        # "Cambio 2026-08-31 (READY con límites)") — a single generic
+        # message covers the whole sweep, from HOMING until READY/ERROR
+        # resolves it.
+        if state_name == "HOMING":
+            self.status_label.setText("Calibrando...")
+        else:
+            self.status_label.setText(state_name)
         self._refresh_controls()
 
     def _on_device_error(self, code: str, message: str):

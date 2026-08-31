@@ -8,7 +8,8 @@ firmware (de prueba o definitivo) debe cumplirlo.
 - USB Serial, 115200 baud.
 - RPi -> ESP32: enmarcado en `<` `>`, sin `\n`. Ej: `PING` se manda como `<PING>`.
 - ESP32 -> RPi: texto plano, una respuesta por línea, con `\n` — sin
-  marco (única excepción: los eventos de calibración, ver abajo).
+  marco, siempre (hasta 2026-08-31 había una excepción, los eventos de
+  calibración; ya no — ver "Cambio 2026-08-31" en Calibración, abajo).
 - Separador de argumentos: `:`.
 - En comandos con 2+ argumentos: el primero puede ser texto (ej. `axis`);
   todo lo demás siempre numérico, nunca texto — por eso `direction` de
@@ -19,7 +20,7 @@ firmware (de prueba o definitivo) debe cumplirlo.
 | Comando | Formato | Respuesta |
 |---|---|---|
 | Ping | `<PING>` | `PONG` |
-| Home | `<HOME>` | `READY` o `ERROR:<code>:<msg>` |
+| Home | `<HOME>` | `READY:xmax:ymax:amin:amax` o `ERROR:code:msg` |
 
 **¿Cuándo los pide la RPi?**
 - `PING`: al tocar "Conectar" (barra superior) — antes de mostrar
@@ -32,13 +33,7 @@ firmware (de prueba o definitivo) debe cumplirlo.
 >> <PING>
 << PONG
 >> <HOME>
-<< <LIMYMIN>
-<< <LIMYMAX:72000>
-<< <LIMXMIN>
-<< <LIMXMAX:48000>
-<< <LIMANGMIN:-5000>
-<< <LIMANGMAX:5400>
-<< READY
+<< READY:48000:72000:-5000:5400
 ```
 
 **Estados internos** que el firmware debe rastrear (no hay comando para
@@ -56,37 +51,53 @@ estado actual):
 
 ## Calibración (durante HOMING)
 
-Al recibir `<HOME>`, el ESP32 barre los 3 ejes en orden **Y, X,
-Angular**. Por cada uno manda 2 eventos (enmarcados en `<` `>`, único
-caso además de los comandos mismos):
+Al recibir `<HOME>`, el ESP32 barre los 3 ejes internamente (Y, X,
+Angular) y reporta los 4 límites juntos en la respuesta `READY` (ver
+tabla en Sistema, arriba) — no hay eventos intermedios: la RPi no sabe
+nada del barrido hasta que llega `READY` (o `ERROR`).
 
-| Evento | Formato | Qué es |
-|---|---|---|
-| Límite mínimo | `<LIMYMIN>` / `<LIMXMIN>` (sin dato) — `<LIMANGMIN:steps>` (con dato) | Paso 0 de ese eje |
-| Límite máximo | `<LIM{AXIS}MAX:steps>` | Pasos crudos de motor, entero — **no cm/grados** |
+`READY:xmax:ymax:amin:amax` — los 4 campos son pasos crudos de motor,
+enteros — **no cm/grados**:
 
-- Y/X: `MIN` no lleva dato (su cero crudo YA es paso 0); `MAX` es un
-  conteo positivo desde ahí. Techos reales del rig: Y=72000, X=48000.
+| Campo | Qué es |
+|---|---|
+| `xmax` | Límite máximo del eje X, conteo positivo desde su paso 0 |
+| `ymax` | Límite máximo del eje Y, conteo positivo desde su paso 0 |
+| `amin` | Límite mínimo del eje angular, con signo |
+| `amax` | Límite máximo del eje angular, con signo |
+
+- Y/X: el límite mínimo de cada eje no viaja en el mensaje — su cero
+  crudo YA es paso 0 por definición. Techos reales del rig: Y=72000,
+  X=48000.
 - **Angular es distinto**: sus limit switches no están en horizontal,
   así que el ESP32 manda el paso YA con signo, relativo a
-  horizontal=paso 0 — `LIMANGMIN:-5000`, `LIMANGMAX:5400` (valores
-  reales del rig). Ver el ejemplo completo arriba, en Sistema.
+  horizontal=paso 0 — `amin=-5000`, `amax=5400` (valores reales del
+  rig). Ver el ejemplo completo arriba, en Sistema.
 - La RPi convierte pasos -> cm/grados con estas constantes (deben
   coincidir con las tuyas): `STEPS_PER_CM_X = 400`,
   `STEPS_PER_CM_Y = 800`, `STEPS_PER_DEG_ANGLE ≈ 111.11` (= 50×800/360
   — reducción angular × pasos/rev del motor, ÷ 360).
 
-**¿Cuándo se usa?** Estos eventos no se piden — salen solos, del ESP32,
-como parte de `HOME`. La RPi los usa para dibujar el mapa de espacio
-disponible ("Espacio Disponible" en la barra de navegación) y para
-mostrar en vivo "Calibrando eje Y: límite máximo alcanzado..." mientras
-dura el barrido.
+**¿Cuándo se usa?** La RPi usa estos 4 valores, una vez que llegan con
+`READY`, para dibujar el mapa de espacio disponible ("Espacio
+Disponible" en la barra de navegación). Mientras dura el barrido (entre
+`<HOME>` y `READY`) solo se muestra un mensaje genérico de "Calibrando"
+— ya no hay progreso en vivo por eje (ver "Cambio 2026-08-31" abajo).
+
+**Cambio 2026-08-31 (READY con límites)**: antes, el ESP32 mandaba 6
+eventos en vivo (`<LIMYMIN>`, `<LIMYMAX:72000>`, etc., enmarcados en
+`<` `>` — la única excepción a "las respuestas del ESP32 van sin
+marco") durante el barrido, seguidos de un `READY` sin datos. El
+compañero simplificó esto: ahora todo llega junto en una sola línea,
+`READY:xmax:ymax:amin:amax`, sin marco (como cualquier otra respuesta).
+Ya no existe ninguna excepción de framing — todas las respuestas del
+ESP32 van sin `<` `>`.
 
 ## Movimiento Manual
 
 | Comando | Formato | Respuesta |
 |---|---|---|
-| Manual | `<MANUAL:axis:direction:steps>` | `OK` o `ERROR:<code>:<msg>` |
+| Manual | `<MANUAL:axis:direction:steps>` | `OK` o `ERROR:code:msg` |
 
 `axis`: `X`/`Y`/`A`. `direction`: `1`=`+`, `0`=`-`. `steps`: entero
 positivo.
@@ -100,7 +111,7 @@ implementes todavía; no rompe nada si tu firmware no lo reconoce.
 
 | Comando | Formato | Respuesta |
 |---|---|---|
-| Get position | `<GET_POSITION>` | `POSITION:<x>:<y>:<angle>` |
+| Get position | `<GET_POSITION>` | `POSITION:x:y:angle` |
 
 Pasos crudos de motor, enteros, posición **absoluta** (no delta) desde
 el `HOME` más reciente. Misma conversión que la calibración.
@@ -124,13 +135,13 @@ partir.
 | Comando | Formato | Respuesta |
 |---|---|---|
 | Iniciar | `<TRAJ_BEGIN:n_points>` | `TRAJ_READY` |
-| Punto | `<TRAJ_POINT:dt_ms:dx_steps:dy_steps:dangle_steps>` | `ACK:<index>` |
-| Finalizar | `<TRAJ_END>` | `TRAJ_STORED` o `ERROR:<code>:<msg>` |
+| Punto | `<TRAJ_POINT:dt_ms:dx_steps:dy_steps:dangle_steps>` | `ACK:index` |
+| Finalizar | `<TRAJ_END>` | `TRAJ_STORED` o `ERROR:code:msg` |
 | Correr | `<RUN>` | `RUNNING`, luego un `TRAJ_PROGRESS` por punto, luego `FINISHED` |
 | Pausar | `<PAUSE>` | `PAUSED` |
 | Reanudar | `<RESUME>` | `RUNNING` |
 | Abortar | `<ABORT>` (solo válido en `PAUSED`) | `ABORTED` o `ERROR:INVALID_STATE:...` |
-| Progreso (no solicitado) | `TRAJ_PROGRESS:<t>:<x>:<y>:<angle>` | — |
+| Progreso (no solicitado) | `TRAJ_PROGRESS:t:x:y:angle` | — |
 
 **¿Cuándo pide la RPi `TRAJ_BEGIN...RUN`?** En 4 momentos, siempre por
 el mismo camino:
@@ -198,7 +209,7 @@ nada. `ABORT` descarta el resto de la trayectoria y vuelve a `IDLE`.
 ## Errores
 
 ```
-ERROR:<code>:<mensaje corto>
+ERROR:code:mensaje corto
 ```
 Ej.: `ERROR:LIMIT_REACHED:X axis`, `ERROR:INVALID_STATE:cannot home while running`,
 `ERROR:POINT_COUNT_MISMATCH:expected 120, got 118`.

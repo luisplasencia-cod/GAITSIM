@@ -41,9 +41,6 @@ class StateMachineBridge(QObject):
     device_error = Signal(str, str)      # code, message
     disconnected = Signal()
     connected = Signal()
-    # axis ("Y"/"X"/"A"), bound ("MIN"/"MAX"), value (raw step count, or
-    # None for MIN — see docs/protocol.md, Calibration Events)
-    calibration_limit = Signal(str, str, object)
 
     def __init__(self, state_machine: SystemStateMachine, parent=None):
         super().__init__(parent)
@@ -54,7 +51,6 @@ class StateMachineBridge(QObject):
         self._state_machine.on_state_changed = self._on_state_changed
         self._state_machine.on_trajectory_finished = self._on_trajectory_finished
         self._state_machine.on_trajectory_progress = self._on_trajectory_progress
-        self._state_machine.on_calibration_limit = self._on_calibration_limit
 
         # Also forward the underlying ESP32Controller's error/disconnect
         # events, since SystemStateMachine consumes them internally but
@@ -98,6 +94,3 @@ class StateMachineBridge(QObject):
 
     def _on_disconnected(self) -> None:
         self.disconnected.emit()
-
-    def _on_calibration_limit(self, axis: str, bound: str, value) -> None:
-        self.calibration_limit.emit(axis, bound, value)

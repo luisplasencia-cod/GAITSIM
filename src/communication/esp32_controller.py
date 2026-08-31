@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 from src.communication import protocol
-from src.communication.protocol import ParsedResponse, Position, TrajectoryPoint, TrajectoryStepDelta
+from src.communication.protocol import HomeLimits, ParsedResponse, Position, TrajectoryPoint, TrajectoryStepDelta
 from src.communication.serial_manager import SerialManager, SerialManagerError
 
 
@@ -102,15 +102,6 @@ class ESP32Controller:
         self.on_resumed: Optional[Callable[[], None]] = None
         self.on_error: Optional[Callable[[str, str], None]] = None  # code, message
         self.on_disconnected: Optional[Callable[[], None]] = None
-        # axis ("Y"/"X"/"A"), bound ("MIN"/"MAX"), value: raw motor STEP
-        # COUNT, not cm/deg — None for Y/X's MIN (that axis's own limit
-        # switch IS raw step zero); for MAX (all axes) and for
-        # angular's MIN, a signed step count, since the angular axis's
-        # limit switches don't sit at level/horizontal (see
-        # docs/protocol.md, Calibration Events, "Cambio 2026-08-26
-        # (eje angular)"). The steps->cm/deg conversion is applied
-        # later, in SystemStateMachine, not here.
-        self.on_calibration_limit: Optional[Callable[[str, str, Optional[float]], None]] = None
 
     # ------------------------------------------------------------------
     # Connection management
@@ -149,17 +140,24 @@ class ESP32Controller:
         except TimeoutWaitingForResponseError:
             return False
 
-    def home(self, timeout: float = HOME_TIMEOUT) -> None:
+    def home(self, timeout: float = HOME_TIMEOUT) -> HomeLimits:
         """
         Trigger homing (calibration + limit mapping).
+
+        Returns:
+            The 4 raw-step limits reported on the "READY:xmax:ymax:amin:
+            amax" response (see docs/protocol.md, "Cambio 2026-08-31
+            (READY con límites)") — converting to cm/deg is
+            SystemStateMachine's job, not this layer's.
 
         Raises:
             TimeoutWaitingForResponseError: If READY is not received in time.
             DeviceReportedError: If the ESP32 responds with ERROR.
         """
-        self._send_and_wait(
+        response = self._send_and_wait(
             protocol.build_home(), expected_kinds=["READY"], timeout=timeout
         )
+        return protocol.parse_home_limits(response.payload)
 
     def move_manual(
         self, axis: str, direction: str, steps: int, timeout: float = DEFAULT_TIMEOUT
@@ -182,7 +180,7 @@ class ESP32Controller:
         Query the ESP32's current tracked (x, y, angle) position — a RAW
         MOTOR STEP COUNT per axis, NOT cm/deg (see docs/protocol.md,
         Consulta de Posición, "Cambio 2026-08-26" — same steps-not-real-
-        units treatment as the calibration sweep's LIM{AXIS}MAX).
+        units treatment as HOME's READY:xmax:ymax:amin:amax).
         Converting to cm/deg is SystemStateMachine.get_position()'s job
         (STEPS_PER_CM_Y/STEPS_PER_CM_X/STEPS_PER_DEG_ANGLE), not this
         method's — callers needing real units must go through that, not
@@ -397,11 +395,6 @@ class ESP32Controller:
             code, _, msg = (response.payload or "").partition(":")
             if self.on_error is not None:
                 self.on_error(code, msg)
-        elif response.kind in protocol.CALIBRATION_LIMIT_KINDS:
-            axis, bound = protocol.CALIBRATION_LIMIT_KINDS[response.kind]
-            value = float(response.payload) if response.payload is not None else None
-            if self.on_calibration_limit is not None:
-                self.on_calibration_limit(axis, bound, value)
         # UNKNOWN or other kinds: silently ignored here; a future
         # logging module (see project roadmap) should record these
         # rather than the controller printing directly.
