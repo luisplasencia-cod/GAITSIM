@@ -513,7 +513,12 @@ class ConnectionScreen(QWidget):
 
         def send_and_run():
             try:
-                result = sm.send_trajectory(points)
+                # Not the CSV/gait ensayo — the synchronized move's dt_ms
+                # values come from placeholder speed constants, not real
+                # gait timing, so let the ESP32 pick its own speed (see
+                # docs/protocol.md, "Cambio 2026-08-31 (TRAJ_POINT sin
+                # tiempo)").
+                result = sm.send_trajectory(points, timed=False)
                 if not result.success:
                     raise RuntimeError(
                         f"Transferencia fallida después de "

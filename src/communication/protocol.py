@@ -143,12 +143,19 @@ class TrajectoryStepDelta:
 
     Attributes:
         dt_ms: Milliseconds elapsed since the previous point (integer,
-            rounded — NOT necessarily uniform between points).
+            rounded — NOT necessarily uniform between points). `None`
+            for an UNTIMED point (see docs/protocol.md, "Cambio
+            2026-08-31 (TRAJ_POINT sin tiempo)") — sent as a 3-field
+            TRAJ_POINT with no dt_ms at all, letting the ESP32 pick its
+            own speed, used for every trajectory EXCEPT the CSV/gait
+            ensayo (initial-position move, joystick moves, safe return
+            between trials — see SystemStateMachine.send_trajectory()'s
+            `timed` parameter).
         dx_steps: Signed raw motor step delta on the X axis.
         dy_steps: Signed raw motor step delta on the Y axis.
         dangle_steps: Signed raw motor step delta on the angular axis.
     """
-    dt_ms: int
+    dt_ms: Optional[int]
     dx_steps: int
     dy_steps: int
     dangle_steps: int
@@ -276,11 +283,22 @@ def build_trajectory_begin(n_points: int) -> str:
 def build_trajectory_step_point(delta: TrajectoryStepDelta) -> str:
     """
     Build a TRAJ_POINT command frame for a single wire-level trajectory
-    delta (see TrajectoryStepDelta and docs/protocol.md, "Cambio
-    2026-08-26 (trayectorias en pasos)"). All 4 fields are plain
-    integers (no decimals — dt_ms and every step count are already
-    whole numbers by the time they reach here).
+    delta (see TrajectoryStepDelta, docs/protocol.md "Cambio 2026-08-26
+    (trayectorias en pasos)" and "Cambio 2026-08-31 (TRAJ_POINT sin
+    tiempo)"). All fields are plain integers (no decimals — dt_ms, when
+    present, and every step count are already whole numbers by the time
+    they reach here).
+
+    `delta.dt_ms is None` builds the UNTIMED 3-field form
+    (`TRAJ_POINT:dx:dy:dangle`, ESP32 picks its own speed); otherwise
+    the TIMED 4-field form (`TRAJ_POINT:dt_ms:dx:dy:dangle`), used only
+    for the CSV/gait ensayo.
     """
+    if delta.dt_ms is None:
+        return (
+            f"<{CMD_TRAJ_POINT}:"
+            f"{delta.dx_steps}:{delta.dy_steps}:{delta.dangle_steps}>"
+        )
     return (
         f"<{CMD_TRAJ_POINT}:"
         f"{delta.dt_ms}:{delta.dx_steps}:{delta.dy_steps}:{delta.dangle_steps}>"

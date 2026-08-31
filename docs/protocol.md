@@ -135,7 +135,8 @@ partir.
 | Comando | Formato | Respuesta |
 |---|---|---|
 | Iniciar | `<TRAJ_BEGIN:n_points>` | `TRAJ_READY` |
-| Punto | `<TRAJ_POINT:dt_ms:dx_steps:dy_steps:dangle_steps>` | `ACK:index` |
+| Punto (CON tiempo — solo ensayo/marcha) | `<TRAJ_POINT:dt_ms:dx_steps:dy_steps:dangle_steps>` | `ACK:index` |
+| Punto (SIN tiempo — todo lo demás) | `<TRAJ_POINT:dx_steps:dy_steps:dangle_steps>` | `ACK:index` |
 | Finalizar | `<TRAJ_END>` | `TRAJ_STORED` o `ERROR:code:msg` |
 | Correr | `<RUN>` | `RUNNING`, luego un `TRAJ_PROGRESS` por punto, luego `FINISHED` |
 | Pausar | `<PAUSE>` | `PAUSED` |
@@ -144,46 +145,75 @@ partir.
 | Progreso (no solicitado) | `TRAJ_PROGRESS:t:x:y:angle` | — |
 
 **¿Cuándo pide la RPi `TRAJ_BEGIN...RUN`?** En 4 momentos, siempre por
-el mismo camino:
+el mismo camino — pero solo el primero manda `TRAJ_POINT` CON tiempo:
 1. Tocar "Load && Send" en la pantalla de Trayectorias — el ensayo CSV.
-2. La primera vez que se toca "Ir a Posición Inicial" después de un `HOME`.
+   **CON tiempo**: es marcha real grabada, el tiempo entre puntos importa.
+2. La primera vez que se toca "Ir a Posición Inicial" después de un
+   `HOME`. **SIN tiempo**.
 3. Mover el joystick manual (cada toque de flecha genera y envía su
-   propia trayectoria de 1 eje).
+   propia trayectoria de 1 eje). **SIN tiempo**.
 4. Tocar "Reiniciar Ensayo", "Elegir Otro Ensayo", o volver a "Ir a
-   Posición Inicial" ya con una posición previa registrada.
+   Posición Inicial" ya con una posición previa registrada. **SIN tiempo**.
 
-**`TRAJ_POINT` es un DELTA, no una posición absoluta**: `dt_ms` =
-milisegundos desde el punto anterior. `dx/dy/dangle_steps` = pasos con
-signo que se mueve cada eje en ese intervalo. El PRIMER punto TAMBIÉN
-es un delta — calculado contra la posición REAL actual del ESP32, no
-asumas que arranca en 0. Acumula así: al recibir `TRAJ_BEGIN`, arranca
-tu suma en tu posición rastreada actual; con cada `TRAJ_POINT`, súmale
-el delta.
+**Cambio 2026-08-31 (TRAJ_POINT sin tiempo)**: antes, TODO `TRAJ_POINT`
+llevaba `dt_ms`, calculado por la RPi contra velocidades asumidas (no
+calibradas al rig real) para cualquier movimiento que no fuera el
+ensayo CSV. Ahora, solo el ensayo CSV/marcha manda la forma CON tiempo
+(el `dt_ms` real grabado en el CSV) — los otros 3 casos mandan la forma
+SIN tiempo (3 campos: `dx:dy:dangle`), y el ESP32 decide su propia
+velocidad para ese movimiento.
+
+**`TRAJ_POINT` es un DELTA, no una posición absoluta** (misma regla en
+ambas formas): `dx/dy/dangle_steps` = pasos con signo que se mueve cada
+eje; en la forma CON tiempo, `dt_ms` = milisegundos desde el punto
+anterior. El PRIMER punto TAMBIÉN es un delta — calculado contra la
+posición REAL actual del ESP32 (pedida con `GET_POSITION` antes de
+`TRAJ_BEGIN`), no asumas que arranca en 0. Por esto la RPi nunca manda
+el punto "t=0" de su propia lista de puntos (sería un delta de duración
+cero contra su propia base t=0) — arranca directo en el primer punto
+real, con ese delta ya calculado contra la posición real. Acumula así:
+al recibir `TRAJ_BEGIN`, arranca tu suma en tu posición rastreada
+actual; con cada `TRAJ_POINT`, súmale el delta.
 
 **`TRAJ_PROGRESS` SÍ es absoluto** (no delta): pasos acumulados en ese
 punto. `t` es tiempo en segundos, sin cambios.
 
-**Ejemplo real completo** (3 puntos en X: 0cm, 3cm, 5cm, arrancando en
-`(0,0,0)`):
+**Ejemplo real completo — ensayo CON tiempo** (2 puntos en X: 3cm,
+5cm, arrancando en `(0,0,0)`):
 ```
->> <TRAJ_BEGIN:3>
+>> <GET_POSITION>
+<< POSITION:0:0:0
+>> <TRAJ_BEGIN:2>
 << TRAJ_READY
->> <TRAJ_POINT:0:0:0:0>
-<< ACK:0
 >> <TRAJ_POINT:500:1200:0:0>
-<< ACK:1
+<< ACK:0
 >> <TRAJ_POINT:500:800:0:0>
-<< ACK:2
+<< ACK:1
 >> <TRAJ_END>
 << TRAJ_STORED
 >> <RUN>
 << RUNNING
-<< TRAJ_PROGRESS:0.0000:0:0:0
 << TRAJ_PROGRESS:0.5000:1200:0:0
 << TRAJ_PROGRESS:1.0000:2000:0:0
 << FINISHED
 ```
-(3cm = 1200 pasos, 5cm = 2000 pasos — `STEPS_PER_CM_X` = 400)
+(3cm = 1200 pasos, 5cm = 2000 pasos — `STEPS_PER_CM_X` = 400; el punto
+"t=0" del CSV, ya en la posición actual, no se manda)
+
+**Ejemplo real — joystick SIN tiempo** (+2cm en X desde `(10, 0, 0)`):
+```
+>> <GET_POSITION>
+<< POSITION:4000:0:0
+>> <TRAJ_BEGIN:1>
+<< TRAJ_READY
+>> <TRAJ_POINT:800:0:0>
+<< ACK:0
+>> <TRAJ_END>
+<< TRAJ_STORED
+>> <RUN>
+<< RUNNING
+```
+(2cm = 800 pasos; sin `dt_ms` — el ESP32 elige la velocidad)
 
 **¿Cuándo pide `PAUSE`/`RESUME`/`ABORT`?** Los botones "Pause"/"Resume"
 de la pantalla de Trayectorias mandan `PAUSE`/`RESUME` directo,

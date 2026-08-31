@@ -31,7 +31,6 @@ Two entry points:
       caller.
 """
 
-import math
 from typing import List
 
 from src.communication.protocol import Position, TrajectoryPoint
@@ -48,12 +47,6 @@ SPEED_X_CM_S = 5.0
 SPEED_Y_CM_S = 5.0
 SPEED_ANGLE_DEG_S = 15.0
 
-# Sampling interval (seconds) between generated waypoints — independent
-# of TRAJ_PROGRESS's own test-only 120ms reporting cadence (see
-# docs/protocol.md); this just controls how finely the straight line in
-# configuration space is diced into TRAJ_POINTs.
-WAYPOINT_INTERVAL_S = 0.1
-
 # Below this total distance (across all 3 axes combined), the move is
 # treated as a no-op rather than generating a degenerate near-zero-
 # duration trajectory.
@@ -62,18 +55,30 @@ _MIN_MOVE_DISTANCE = 1e-6
 
 def _interpolate(start: Position, target: Position) -> List[TrajectoryPoint]:
     """
-    Core synchronized straight-line interpolation from `start` to
-    `target`, with NO calibration-space validation — callers are
-    responsible for validating whatever of `start`/`target` is operator
-    input before calling this (see generate_synchronized_trajectory,
-    which validates `target`; generate_safe_return_trajectory, which
-    validates `target` once and derives its own intermediate waypoints
-    from already-real/already-validated positions).
+    Core synchronized straight-line move from `start` to `target`, with
+    NO calibration-space validation — callers are responsible for
+    validating whatever of `start`/`target` is operator input before
+    calling this (see generate_synchronized_trajectory, which validates
+    `target`; generate_safe_return_trajectory, which validates `target`
+    once and derives its own intermediate waypoints from already-real/
+    already-validated positions).
 
-    Returns a list of TrajectoryPoint starting at t=0 (start.x, start.y,
-    start.angle) and ending at t=T (target.x, target.y, target.angle),
-    sampled every WAYPOINT_INTERVAL_S. Empty list if target is
-    indistinguishable from start (nothing to move).
+    Returns exactly 2 points — (start.x, start.y, start.angle) at t=0
+    and (target.x, target.y, target.angle) at t=T — rather than
+    subdividing the straight line into intermediate waypoints: the
+    ESP32 firmware moves all 3 axes concurrently at their own constant
+    velocity (delta/T) for the whole span of a single TRAJ_POINT (see
+    run_trajectory() in the definitive firmware's main.cpp), so one
+    point per straight segment already produces smooth synchronized
+    motion — subdividing further only adds points without changing the
+    physical motion, and risks exceeding the firmware's fixed-size
+    trajectory buffer (MAX_DATA_LENGTH, configurable_motion_data.h) on
+    long or multi-phase moves. The leading t=0 point exists so callers
+    can validate/stitch against a known start; it never reaches the
+    wire as a TRAJ_POINT (SystemStateMachine._points_to_step_deltas()
+    drops any point at t=0, since the ESP32 rejects a zero-duration
+    TRAJ_POINT). Empty list if target is indistinguishable from start
+    (nothing to move).
     """
     delta_x = target.x - start.x
     delta_y = target.y - start.y
@@ -87,26 +92,10 @@ def _interpolate(start: Position, target: Position) -> List[TrajectoryPoint]:
     duration_angle = abs(delta_angle) / SPEED_ANGLE_DEG_S
     total_duration = max(duration_x, duration_y, duration_angle)
 
-    n_intervals = max(1, math.ceil(total_duration / WAYPOINT_INTERVAL_S))
-
-    points = []
-    for i in range(n_intervals + 1):
-        t = min(i * WAYPOINT_INTERVAL_S, total_duration)
-        fraction = t / total_duration if total_duration > 0 else 1.0
-        points.append(
-            TrajectoryPoint(
-                t=t,
-                x=start.x + delta_x * fraction,
-                y=start.y + delta_y * fraction,
-                angle=start.angle + delta_angle * fraction,
-            )
-        )
-    # Guarantee the last point lands exactly on the target (floating-
-    # point fraction accumulation could otherwise leave it a hair off).
-    points[-1] = TrajectoryPoint(
-        t=total_duration, x=target.x, y=target.y, angle=target.angle
-    )
-    return points
+    return [
+        TrajectoryPoint(t=0.0, x=start.x, y=start.y, angle=start.angle),
+        TrajectoryPoint(t=total_duration, x=target.x, y=target.y, angle=target.angle),
+    ]
 
 
 def generate_synchronized_trajectory(
@@ -128,10 +117,10 @@ def generate_synchronized_trajectory(
             generated in that case.
 
     Returns:
-        A list of TrajectoryPoint, starting at t=0 (start.x, start.y,
-        start.angle) and ending at t=T (target.x, target.y,
-        target.angle), sampled every WAYPOINT_INTERVAL_S. Empty list if
-        target is indistinguishable from start (nothing to move).
+        Exactly 2 points — t=0 (start.x, start.y, start.angle) and t=T
+        (target.x, target.y, target.angle) — see _interpolate(). Empty
+        list if target is indistinguishable from start (nothing to
+        move).
     """
     validate_position(target, calibration_space)
     return _interpolate(start, target)

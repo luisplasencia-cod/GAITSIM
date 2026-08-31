@@ -80,9 +80,13 @@ class ESP32Controller:
 
     DEFAULT_TIMEOUT = 3.0        # seconds, for fast commands
     # Homing now includes a full 3-axis limit-mapping sweep (see
-    # docs/protocol.md, Calibration Events) — the test firmware spends
-    # ~4s per axis (~12s total); real margin on top of that.
-    HOME_TIMEOUT = 20.0
+    # docs/protocol.md, Calibration Events). On real hardware this is a
+    # physical motor sweep to each limit switch with no predictable
+    # upper bound (confirmed on real hardware to take >1 minute, well
+    # past the old 20s value tuned for the test firmware's ~4s/axis
+    # simulated sweep) — so HOME waits for READY with no timeout at all
+    # rather than guessing a duration.
+    HOME_TIMEOUT = None
 
     def __init__(self, port: str, baudrate: int = 115200):
         self._serial = SerialManager(port=port, baudrate=baudrate)
@@ -140,7 +144,7 @@ class ESP32Controller:
         except TimeoutWaitingForResponseError:
             return False
 
-    def home(self, timeout: float = HOME_TIMEOUT) -> HomeLimits:
+    def home(self, timeout: Optional[float] = HOME_TIMEOUT) -> HomeLimits:
         """
         Trigger homing (calibration + limit mapping).
 
@@ -151,7 +155,10 @@ class ESP32Controller:
             SystemStateMachine's job, not this layer's.
 
         Raises:
-            TimeoutWaitingForResponseError: If READY is not received in time.
+            TimeoutWaitingForResponseError: If timeout is not None and
+                READY is not received in time. With the default (None),
+                this call blocks indefinitely for READY — real homing
+                has no predictable duration.
             DeviceReportedError: If the ESP32 responds with ERROR.
         """
         response = self._send_and_wait(

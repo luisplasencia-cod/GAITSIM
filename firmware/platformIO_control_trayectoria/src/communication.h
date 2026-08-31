@@ -176,7 +176,8 @@ void communication_tx(Packet &packet){
     Serial.print(':');
     Serial.print(packet.parameters[i]);
   }
-  
+
+  Serial.print('\n');
   //Serial.print('>');
 }
 

@@ -603,7 +603,10 @@ class TrajectoryScreen(QWidget):
         except TrajectoryOutOfRangeError as exc:
             raise RuntimeError(f"Ensayo rechazado: {exc}") from exc
 
-        result = sm.send_trajectory(points)
+        # The CSV/gait ensayo IS real recorded gait timing — the one
+        # case that needs the TIMED TRAJ_POINT form (see docs/protocol.md,
+        # "Cambio 2026-08-31 (TRAJ_POINT sin tiempo)").
+        result = sm.send_trajectory(points, timed=True)
         if not result.success:
             raise RuntimeError(
                 f"Transfer failed after {result.points_acknowledged} "

@@ -365,7 +365,9 @@ class SystemStateMachine:
             angle=raw.angle / self.STEPS_PER_DEG_ANGLE,
         )
 
-    def send_trajectory(self, points: List[TrajectoryPoint]) -> TrajectoryTransferResult:
+    def send_trajectory(
+        self, points: List[TrajectoryPoint], timed: bool = True
+    ) -> TrajectoryTransferResult:
         """
         Transfer a trajectory to the ESP32. Transitions
         RECEIVING_TRAJECTORY -> IDLE regardless of success or failure
@@ -383,6 +385,21 @@ class SystemStateMachine:
         safe_return_to_position's 5-step sequence — since they all
         funnel through here.
 
+        Args:
+            timed: True (default) sends the TIMED 4-field TRAJ_POINT
+                (dt_ms included) — only the CSV/gait ensayo needs this,
+                since its dt_ms values encode the actual recorded gait
+                timing. False sends the UNTIMED 3-field form (no
+                dt_ms), letting the ESP32 pick its own speed — used for
+                every other trajectory (see docs/protocol.md, "Cambio
+                2026-08-31 (TRAJ_POINT sin tiempo)"): those don't
+                represent real gait timing, only placeholder speed
+                constants (see trajectory_generator.py), so there is
+                nothing meaningful to send. _run_trajectory_blocking()
+                (joystick moves, safe return) always passes False; only
+                TrajectoryScreen's CSV "Load && Send" relies on the
+                True default.
+
         Raises:
             InvalidTransitionError: If not currently idle.
         """
@@ -391,26 +408,53 @@ class SystemStateMachine:
                 f"Cannot send trajectory while in state {self._state.name}."
             )
         self._set_state(SystemState.RECEIVING_TRAJECTORY)
-        deltas = self._points_to_step_deltas(points)
+        deltas = self._points_to_step_deltas(points, timed=timed)
         result = self._controller.send_trajectory(deltas)
         self._set_state(SystemState.IDLE)
         return result
 
-    def _points_to_step_deltas(self, points: List[TrajectoryPoint]) -> List[TrajectoryStepDelta]:
+    def _points_to_step_deltas(
+        self, points: List[TrajectoryPoint], timed: bool = True
+    ) -> List[TrajectoryStepDelta]:
         """
         Converts an absolute cm/deg/seconds TrajectoryPoint list into
         the signed step-delta list TRAJ_POINT carries on the wire (see
         docs/protocol.md, Comandos de Transferencia de Trayectoria,
-        "Cambio 2026-08-26 (trayectorias en pasos)").
+        "Cambio 2026-08-26 (trayectorias en pasos)" and "Cambio
+        2026-08-31 (TRAJ_POINT sin tiempo)").
 
-        Every point's delta (INCLUDING the first) is computed against
-        the platform's ACTUAL current position (self.get_position()),
-        never assumed to already match points[0] — this mirrors exactly
-        how the firmware itself accumulates (its running total starts
-        at its own tracked position when TRAJ_BEGIN arrives, see the
-        test firmware's handleTrajBegin()/trajAccumXSteps). Produces
-        exactly len(points) deltas — same count as before this change,
-        so TRAJ_BEGIN's n_points is unaffected.
+        `timed=False` (see send_trajectory()'s `timed` parameter) still
+        computes each point's own t_ms internally (needed to drop the
+        leading t=0 point below, same as the timed case), but sets each
+        resulting TrajectoryStepDelta.dt_ms to None instead of the
+        computed duration — build_trajectory_step_point() then emits
+        the UNTIMED 3-field TRAJ_POINT for it.
+
+        Every point's delta (INCLUDING the first one actually sent) is
+        computed against the platform's ACTUAL current position
+        (self.get_position()), never assumed to already match points[0]
+        — this mirrors exactly how the firmware itself accumulates (its
+        running total starts at its own tracked position when
+        TRAJ_BEGIN arrives, see the test firmware's
+        handleTrajBegin()/trajAccumXSteps).
+
+        A leading point at t=0 (the convention every CSV/generated
+        trajectory starts with — see trajectory_loader.py,
+        trajectory_generator.py) is dropped rather than sent as a wire
+        TRAJ_POINT: since our own baseline is also t=0 (`current`, "now"),
+        that point would always produce dt_ms=0, and the definitive
+        ESP32 firmware treats dt_ms<=0 as a hard failure (see
+        run_trajectory() in the teammate's main.cpp — it stops the
+        whole trajectory before any motion happens, not just that one
+        point). Its position is still meaningful — it becomes the
+        baseline the FIRST SENT point's delta is computed against,
+        together with `current`, so a real mismatch between "where the
+        trajectory assumes it starts" and "where the ESP32 actually is"
+        is still captured in that first sent delta, exactly as before;
+        only the always-zero-duration entry itself is skipped. Produces
+        len(points) deltas normally, or len(points) - 1 when points[0].t
+        == 0.0 — TRAJ_BEGIN's n_points (computed downstream from
+        len(deltas)) reflects this automatically.
 
         Rounds each point's ABSOLUTE step position first, then takes
         the difference between consecutive ROUNDED absolute values —
@@ -420,6 +464,10 @@ class SystemStateMachine:
         definitive firmware (round each absolute x/y/angle to steps
         first, then diff consecutive rounded values for dx/dy/dk).
         """
+        if not points:
+            return []
+        if points[0].t == 0.0:
+            points = points[1:]
         if not points:
             return []
 
@@ -438,7 +486,7 @@ class SystemStateMachine:
         for point in points:
             t_ms, x, y, a = to_steps(point.t, point.x, point.y, point.angle)
             deltas.append(TrajectoryStepDelta(
-                dt_ms=t_ms - prev_t_ms,
+                dt_ms=(t_ms - prev_t_ms) if timed else None,
                 dx_steps=x - prev_x,
                 dy_steps=y - prev_y,
                 dangle_steps=a - prev_a,
@@ -631,7 +679,7 @@ class SystemStateMachine:
             RuntimeError: If the trajectory transfer itself fails.
             Any exception run() may raise.
         """
-        result = self.send_trajectory(points)
+        result = self.send_trajectory(points, timed=False)
         if not result.success:
             raise RuntimeError(
                 f"No se pudo transferir la trayectoria de retorno: {result}"
