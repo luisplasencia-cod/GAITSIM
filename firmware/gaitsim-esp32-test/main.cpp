@@ -260,20 +260,39 @@ void handleTrajPoint(const String &line) {
     sendError("POINT_COUNT_MISMATCH", "received more points than announced");
     return;
   }
-  // Format (2026-08-26): TRAJ_POINT:<dt_ms>:<dx_steps>:<dy_steps>:<dangle_steps>
-  // — a signed step DELTA from the previous point (or from the current
-  // tracked position, for the first point), NOT an absolute position
-  // (see docs/protocol.md, "Cambio 2026-08-26 (trayectorias en pasos)").
+  // Two forms (see docs/protocol.md, "Cambio 2026-08-26 (trayectorias en
+  // pasos)" and "Cambio 2026-08-31 (TRAJ_POINT sin tiempo)"), both a
+  // signed step DELTA from the previous point (or from the current
+  // tracked position, for the first point), NOT an absolute position:
+  //   TIMED (5 tokens):   TRAJ_POINT:<dt_ms>:<dx_steps>:<dy_steps>:<dangle_steps>
+  //   UNTIMED (4 tokens): TRAJ_POINT:<dx_steps>:<dy_steps>:<dangle_steps>
+  // Only the CSV/gait ensayo sends the timed form; everything else
+  // (initial position, joystick, safe return) sends untimed. dtMs is
+  // only ever used below for TRAJ_PROGRESS's `t` field (a live-plot
+  // convenience), never for real pacing (see handleRun()'s fixed
+  // 120ms TEST-ONLY cadence) — 0 for an untimed point is harmless,
+  // those moves aren't plotted anyway (trajectory_screen.py's
+  // _plot_active gating).
   String parts[5];
   int n = splitCommand(line, parts, 5);
-  if (n != 5) {
-    sendError("MALFORMED", "expected TRAJ_POINT:<dt_ms>:<dx>:<dy>:<dangle>");
+  unsigned long dtMs;
+  long dxSteps, dySteps, dangleSteps;
+  if (n == 5) {
+    dtMs = (unsigned long)parts[1].toInt();
+    dxSteps = parts[2].toInt();
+    dySteps = parts[3].toInt();
+    dangleSteps = parts[4].toInt();
+  } else if (n == 4) {
+    dtMs = 0;
+    dxSteps = parts[1].toInt();
+    dySteps = parts[2].toInt();
+    dangleSteps = parts[3].toInt();
+  } else {
+    sendError("MALFORMED",
+              "expected TRAJ_POINT:<dt_ms>:<dx>:<dy>:<dangle> or "
+              "TRAJ_POINT:<dx>:<dy>:<dangle>");
     return;
   }
-  unsigned long dtMs = (unsigned long)parts[1].toInt();
-  long dxSteps = parts[2].toInt();
-  long dySteps = parts[3].toInt();
-  long dangleSteps = parts[4].toInt();
 
   trajAccumXSteps += dxSteps;
   trajAccumYSteps += dySteps;
