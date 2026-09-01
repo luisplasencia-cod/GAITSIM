@@ -134,15 +134,36 @@ partir.
 
 | Comando | Formato | Respuesta |
 |---|---|---|
-| Iniciar | `<TRAJ_BEGIN:n_points>` | `TRAJ_READY` |
-| Punto (CON tiempo — solo ensayo/marcha) | `<TRAJ_POINT:dt_ms:dx_steps:dy_steps:dangle_steps>` | `ACK:index` |
-| Punto (SIN tiempo — todo lo demás) | `<TRAJ_POINT:dx_steps:dy_steps:dangle_steps>` | `ACK:index` |
+| Iniciar | `<TRAJ_BEGIN:tipo:n_points>` | `TRAJ_READY` o `ERROR:code:msg` |
+| Punto (CON tiempo — solo ensayo/marcha) | `<TRAJ_POINT:index:dt_ms:dx_steps:dy_steps:dangle_steps>` | `ACK:index` |
+| Punto (SIN tiempo — todo lo demás) | `<TRAJ_POINT:index:dx_steps:dy_steps:dangle_steps>` | `ACK:index` |
 | Finalizar | `<TRAJ_END>` | `TRAJ_STORED` o `ERROR:code:msg` |
-| Correr | `<RUN>` | `RUNNING`, luego un `TRAJ_PROGRESS` por punto, luego `FINISHED` |
+| Correr | `<RUN:tipo>` | `RUNNING`, luego un `TRAJ_PROGRESS` por punto, luego `FINISHED` |
 | Pausar | `<PAUSE>` | `PAUSED` |
 | Reanudar | `<RESUME>` | `RUNNING` |
 | Abortar | `<ABORT>` (solo válido en `PAUSED`) | `ABORTED` o `ERROR:INVALID_STATE:...` |
 | Progreso (no solicitado) | `TRAJ_PROGRESS:t:x:y:angle` | — |
+| Estado (solicitado) | `<TRAJ_STATUS>` | `RUNNING`, `PAUSED`, `FINISHED` o `ERROR:INVALID_STATE:...` |
+
+**Cambio 2026-09-01 (`TRAJ_BEGIN`/`RUN` con tipo)**: ambos comandos
+ahora llevan un `tipo` — `1` = CON tiempo, `2` = SIN tiempo — así el
+firmware sabe de antemano qué forma de `TRAJ_POINT` va a recibir
+(4 campos o 3), en vez de tener que inferirlo contando los `:` de cada
+línea. `RUN` manda el MISMO `tipo` que su `TRAJ_BEGIN` correspondiente,
+como verificación cruzada: si no coincide, el ESP32 debe responder
+`ERROR:TYPE_MISMATCH:...` en vez de arrancar. `RESUME` NO lleva `tipo`
+— continúa una ejecución que el ESP32 ya clasificó en el `RUN` original.
+
+**Cambio 2026-09-01 (`TRAJ_POINT` con índice)**: cada `TRAJ_POINT` ahora
+lleva su propio `index` (0-based) como PRIMER parámetro, antes que los
+demás — en ambas formas, CON y SIN tiempo — coincidiendo con el
+`n_points` de su `TRAJ_BEGIN` (`0..n_points-1`). Robustez extra: el
+ESP32 debe verificar que el `index` recibido coincide exactamente con
+cuántos puntos ya recibió (`ERROR:POINT_INDEX_MISMATCH:...` si no
+coincide) — independiente del chequeo de conteo total que ya hace
+`TRAJ_END`. Distinto de `ACK:index` (la respuesta del ESP32, que ya
+existía) — ese es el eco del ESP32 hacia la RPi, este `index` nuevo es
+lo que la RPi manda hacia el ESP32.
 
 **¿Cuándo pide la RPi `TRAJ_BEGIN...RUN`?** En 4 momentos, siempre por
 el mismo camino — pero solo el primero manda `TRAJ_POINT` CON tiempo:
@@ -183,15 +204,15 @@ punto. `t` es tiempo en segundos, sin cambios.
 ```
 >> <GET_POSITION>
 << POSITION:0:0:0
->> <TRAJ_BEGIN:2>
+>> <TRAJ_BEGIN:1:2>
 << TRAJ_READY
->> <TRAJ_POINT:500:1200:0:0>
+>> <TRAJ_POINT:0:500:1200:0:0>
 << ACK:0
->> <TRAJ_POINT:500:800:0:0>
+>> <TRAJ_POINT:1:500:800:0:0>
 << ACK:1
 >> <TRAJ_END>
 << TRAJ_STORED
->> <RUN>
+>> <RUN:1>
 << RUNNING
 << TRAJ_PROGRESS:0.5000:1200:0:0
 << TRAJ_PROGRESS:1.0000:2000:0:0
@@ -204,13 +225,13 @@ punto. `t` es tiempo en segundos, sin cambios.
 ```
 >> <GET_POSITION>
 << POSITION:4000:0:0
->> <TRAJ_BEGIN:1>
+>> <TRAJ_BEGIN:2:1>
 << TRAJ_READY
->> <TRAJ_POINT:800:0:0>
+>> <TRAJ_POINT:0:800:0:0>
 << ACK:0
 >> <TRAJ_END>
 << TRAJ_STORED
->> <RUN>
+>> <RUN:2>
 << RUNNING
 ```
 (2cm = 800 pasos; sin `dt_ms` — el ESP32 elige la velocidad)
@@ -236,6 +257,36 @@ pausa.
 `PAUSE` se reanuda con `RESUME` exactamente donde iba, sin reenviar
 nada. `ABORT` descarta el resto de la trayectoria y vuelve a `IDLE`.
 
+**Cambio 2026-09-01 (`TRAJ_STATUS`, robustez)**: hasta ahora, la RPi
+sabía que una trayectoria terminó únicamente por el `FINISHED` no
+solicitado que llega al final de `RUN`/`RESUME`. Como robustez extra
+(por si esa línea se pierde o llega corrupta en el cable), la RPi ahora
+también pide `<TRAJ_STATUS>` activamente cada 1 segundo, empezando justo
+después de recibir la confirmación `RUNNING` (de `RUN` o `RESUME`), y
+hasta que detecta un estado terminal — aplica igual a trayectorias CON
+tiempo (ensayo/marcha) y SIN tiempo (joystick, posición inicial, retorno
+seguro), ya que es independiente de la forma de `TRAJ_POINT`. La
+respuesta reutiliza las mismas palabras que ya existían para
+`RUNNING`/`PAUSED`/`FINISHED` — no hay formato nuevo. `PAUSE`/`ABORT`
+detienen este sondeo del lado RPi de inmediato (ya tienen su propia
+respuesta síncrona); fuera de `RUNNING`/`PAUSED` el ESP32 responde
+`ERROR:INVALID_STATE:...`.
+
+**Ejemplo real — polling durante RUNNING:**
+```
+>> <RUN:1>
+<< RUNNING
+<< TRAJ_PROGRESS:0.5000:1200:0:0
+>> <TRAJ_STATUS>
+<< RUNNING
+<< TRAJ_PROGRESS:1.0000:2000:0:0
+>> <TRAJ_STATUS>
+<< FINISHED
+```
+(el `FINISHED` no solicitado normal puede llegar antes, después, o
+casi junto con la respuesta de `TRAJ_STATUS` — la RPi solo reacciona a
+la primera de las dos que le llegue)
+
 ## Errores
 
 ```
@@ -248,7 +299,9 @@ Ej.: `ERROR:LIMIT_REACHED:X axis`, `ERROR:INVALID_STATE:cannot home while runnin
 
 `GOTO`, `STATUS`, `STOP` existieron y se quitaron por no tener ningún
 uso real. Si tu firmware no los reconoce, esto es lo normal (no rompe
-nada):
+nada). Nota: `STATUS` (aquí) y `TRAJ_STATUS` (2026-09-01, ver
+Trayectorias arriba) son comandos DISTINTOS — el primero sigue
+eliminado, no lo reintroduzcas.
 ```
 >> <GOTO:1:1:1>
 << ERROR:UNKNOWN_COMMAND:GOTO:1:1:1

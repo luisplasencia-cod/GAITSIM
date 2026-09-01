@@ -24,7 +24,8 @@ import pyqtgraph as pg
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QComboBox, QGroupBox, QInputDialog, QMessageBox
+    QPushButton, QLabel, QComboBox, QGroupBox, QInputDialog, QMessageBox,
+    QDoubleSpinBox
 )
 
 from src.communication.protocol import TrajectoryPoint
@@ -39,10 +40,11 @@ from src.ui.style import (
     BUTTON_STYLE_SLIM, BUTTON_STYLE_PRIMARY_SLIM,
     LAYOUT_SPACING, LAYOUT_MARGIN, FONT_SIZE_NORMAL,
     COLOR_AXIS_X, COLOR_AXIS_Y, COLOR_AXIS_ANGLE,
-    COLOR_BG, COLOR_TEXT, COLOR_TEXT_MUTED,
+    COLOR_BG, COLOR_TEXT, COLOR_TEXT_MUTED, COLOR_DANGER,
 )
 from src.utils import position_library
 from src.utils.trajectory_library import list_trajectories, load_trajectory_by_id
+from src.controllers.system_state import TrajectorySpeedExceededError
 from src.utils.trajectory_validator import TrajectoryOutOfRangeError, validate_trajectory
 
 
@@ -195,6 +197,29 @@ class TrajectoryScreen(QWidget):
         self.trajectory_combo.setStyleSheet(slim_combo_style)
         select_layout.addWidget(self.trajectory_combo)
 
+        # Time-scaling factor applied to the CSV's own recorded `t`
+        # values on load (see _on_send_clicked) — the simulator cannot
+        # reproduce real gait timing in real time yet, so every ensayo
+        # (TIMED TRAJ_POINT, 4-field form) needs its whole timeline
+        # stretched by this factor before being sent. Only affects the
+        # CSV/gait ensayo — trajectories sent WITHOUT time (joystick,
+        # posición inicial, retorno seguro) never go through this.
+        scale_row = QHBoxLayout()
+        scale_label = QLabel("Escala de tiempo (x):")
+        scale_label.setStyleSheet(f"font-size: {FONT_SIZE_NORMAL}px;")
+        self.time_scale_spinbox = QDoubleSpinBox()
+        self.time_scale_spinbox.setStyleSheet(slim_combo_style)
+        # No fixed upper cap (per Luis's explicit choice) — only a
+        # positive-value floor above 0, since a zero/negative scale
+        # would collapse or invert the trajectory's timeline.
+        self.time_scale_spinbox.setRange(0.01, 1_000_000.0)
+        self.time_scale_spinbox.setDecimals(2)
+        self.time_scale_spinbox.setSingleStep(1.0)
+        self.time_scale_spinbox.setValue(30.0)
+        scale_row.addWidget(scale_label)
+        scale_row.addWidget(self.time_scale_spinbox, stretch=1)
+        select_layout.addLayout(scale_row)
+
         row = QHBoxLayout()
         self.refresh_button = QPushButton("Refresh List")
         self.refresh_button.setStyleSheet(BUTTON_STYLE_SLIM)
@@ -203,6 +228,19 @@ class TrajectoryScreen(QWidget):
         row.addWidget(self.refresh_button)
         row.addWidget(self.send_button)
         select_layout.addLayout(row)
+
+        # Max per-axis speed the just-sent (or just-rejected — see
+        # TrajectorySpeedExceededError) trajectory actually implies —
+        # added 2026-09-01 alongside the speed safety gate in
+        # SystemStateMachine, so the operator can see the number instead
+        # of only finding out from a rejection message or, worse, from
+        # the motor itself. Refreshed after every action this screen
+        # runs through _run_action (see _update_speed_label).
+        self.speed_label = QLabel("Vel. máx: —")
+        self.speed_label.setStyleSheet(
+            f"font-size: {FONT_SIZE_NORMAL}px; color: {COLOR_TEXT_MUTED()};"
+        )
+        select_layout.addWidget(self.speed_label)
 
         sidebar.addWidget(select_box)
 
@@ -523,11 +561,26 @@ class TrajectoryScreen(QWidget):
             return
 
         try:
-            self._ensayo_trajectory = load_trajectory_by_id(trajectory_id)
+            loaded = load_trajectory_by_id(trajectory_id)
         except Exception as exc:
             self.info_label.setText(f"Failed to load '{trajectory_id}': {exc}")
             self._ensayo_trajectory = None
             return
+
+        # Stretch the whole recorded timeline by the chosen factor
+        # (default 30x, see time_scale_spinbox above) — the simulator
+        # can't reproduce real gait speed yet, so every `t` value is
+        # scaled up before this trajectory is ever offset/validated/
+        # sent. x/y/angle are untouched: only how long the ESP32 takes
+        # to traverse the same points changes. Applied once here, at
+        # load time, so "Reiniciar Ensayo" (which resends this same
+        # `_ensayo_trajectory`) automatically reuses the already-scaled
+        # timeline without reapplying the factor.
+        time_scale = self.time_scale_spinbox.value()
+        self._ensayo_trajectory = [
+            TrajectoryPoint(t=p.t * time_scale, x=p.x, y=p.y, angle=p.angle)
+            for p in loaded
+        ]
         # Whatever position the PREVIOUS trajectory (if any) was sent
         # for is no longer relevant — Run stays blocked until THIS one
         # is actually sent (see _send_and_check / _refresh_controls).
@@ -588,6 +641,16 @@ class TrajectoryScreen(QWidget):
         send_trajectory() itself does not raise on a failed transfer
         (it returns a result object) — we raise here so the worker's
         failed/succeeded signals reflect the real outcome.
+
+        send_trajectory() ALSO rejects (TrajectorySpeedExceededError,
+        never transmitted) any point implying an unsafe per-axis speed
+        — see SystemStateMachine.MAX_SPEED_X_CM_S/_Y_CM_S/_ANGLE_DEG_S.
+        Added 2026-09-01 after a real Y-axis overspeed caused by a stale
+        `_position_session` offset landing in the ensayo's timed first
+        point (see that exception's docstring); this is a second,
+        independent gate from the position-bounds check above — a point
+        can be well within the calibrated space and still be unsafely
+        FAST to get to from wherever the platform actually is.
         """
         sm = self._bridge.state_machine
         points = self._offset_points(self._ensayo_trajectory)
@@ -606,7 +669,10 @@ class TrajectoryScreen(QWidget):
         # The CSV/gait ensayo IS real recorded gait timing — the one
         # case that needs the TIMED TRAJ_POINT form (see docs/protocol.md,
         # "Cambio 2026-08-31 (TRAJ_POINT sin tiempo)").
-        result = sm.send_trajectory(points, timed=True)
+        try:
+            result = sm.send_trajectory(points, timed=True)
+        except TrajectorySpeedExceededError as exc:
+            raise RuntimeError(f"Ensayo rechazado: {exc}") from exc
         if not result.success:
             raise RuntimeError(
                 f"Transfer failed after {result.points_acknowledged} "
@@ -790,11 +856,42 @@ class TrajectoryScreen(QWidget):
 
     def _on_action_succeeded(self, message: str):
         self.info_label.setText(message)
+        self._update_speed_label()
         self._refresh_controls()
 
     def _on_action_failed(self, message: str):
         self.info_label.setText(f"Failed: {message}")
+        self._update_speed_label()
         self._refresh_controls()
+
+    def _update_speed_label(self):
+        """
+        Reflects SystemStateMachine.last_trajectory_max_speeds — the max
+        per-axis speed implied by whichever trajectory this screen's
+        _run_action last attempted to send (Load && Send, Reiniciar
+        Ensayo). Called on BOTH success and failure: a rejection by
+        TrajectorySpeedExceededError still updates the underlying value
+        (see that exception's docstring), so this is exactly how an
+        operator sees WHY a send was rejected, in the same units as the
+        MAX_SPEED_* limits themselves — not just from the text message.
+        Harmless no-op-looking call after an unrelated action (e.g. Run,
+        which doesn't recompute deltas) — it just redraws the same
+        number already showing.
+        """
+        sm = self._bridge.state_machine
+        x, y, angle = sm.last_trajectory_max_speeds
+        exceeded = (
+            x > sm.MAX_SPEED_X_CM_S
+            or y > sm.MAX_SPEED_Y_CM_S
+            or angle > sm.MAX_SPEED_ANGLE_DEG_S
+        )
+        self.speed_label.setText(
+            f"Vel. máx: X={x:.1f} cm/s   Y={y:.1f} cm/s   Á={angle:.1f} °/s"
+        )
+        color = COLOR_DANGER() if exceeded else COLOR_TEXT_MUTED()
+        self.speed_label.setStyleSheet(
+            f"font-size: {FONT_SIZE_NORMAL}px; color: {color};"
+        )
 
     # ------------------------------------------------------------------
     # Reacting to state changes

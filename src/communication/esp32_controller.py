@@ -24,6 +24,7 @@ Thread safety:
 """
 
 import threading
+import time
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
@@ -106,6 +107,29 @@ class ESP32Controller:
         self.on_resumed: Optional[Callable[[], None]] = None
         self.on_error: Optional[Callable[[str, str], None]] = None  # code, message
         self.on_disconnected: Optional[Callable[[], None]] = None
+
+        # --- TRAJ_STATUS polling (2026-09-01, robustness backstop) ---
+        # See _start_status_polling()/_status_poll_loop() below: a
+        # background thread that actively asks <TRAJ_STATUS> every 1s
+        # while a trajectory is RUNNING, so completion is still detected
+        # even if the normal unsolicited FINISHED line is ever lost on
+        # the wire. `_status_poll_generation` (guarded by
+        # `_status_poll_lock`) is how a poller thread notices it has
+        # been superseded/stopped without needing thread.join() (which
+        # would risk a self-join deadlock when the poller itself is the
+        # one detecting the terminal status) — every call to
+        # _start_status_polling()/_stop_status_polling() bumps it, and
+        # a running loop iteration checks it before acting.
+        self._status_poll_lock = threading.Lock()
+        self._status_poll_generation = 0
+        self._status_poll_interval = 1.0
+        # Guards on_trajectory_finished so it fires exactly once per
+        # run, whichever of the two independent paths notices FINISHED
+        # first: the normal unsolicited line (_handle_line) or this
+        # poller (_status_poll_loop). Reset in run() only — a
+        # pause()/resume() cycle is still the SAME run.
+        self._finished_notify_lock = threading.Lock()
+        self._finished_notified = False
 
     # ------------------------------------------------------------------
     # Connection management
@@ -206,7 +230,10 @@ class ESP32Controller:
     # ------------------------------------------------------------------
 
     def send_trajectory(
-        self, deltas: List[TrajectoryStepDelta], timeout_per_point: float = DEFAULT_TIMEOUT
+        self,
+        deltas: List[TrajectoryStepDelta],
+        timed: bool = True,
+        timeout_per_point: float = DEFAULT_TIMEOUT,
     ) -> TrajectoryTransferResult:
         """
         Send a full trajectory to the ESP32, delta by delta.
@@ -226,6 +253,15 @@ class ESP32Controller:
                 conversion knowledge of its own (see
                 SystemStateMachine.send_trajectory(), the only real
                 caller, which does that conversion).
+            timed: Must match exactly whether `deltas` themselves carry
+                dt_ms (see TrajectoryStepDelta.dt_ms) — announced to the
+                ESP32 via TRAJ_BEGIN's `tipo` field (2026-09-01,
+                "TRAJ_BEGIN con tipo", see docs/protocol.md) so it knows
+                in advance whether the TRAJ_POINT lines that follow will
+                have 4 fields or 3. The SAME value must later be passed
+                to run() for this trajectory (see run()'s own `timed`
+                parameter) — SystemStateMachine.run() does this by
+                remembering the value passed here.
             timeout_per_point: Timeout, in seconds, for each individual
                 ACK while sending points.
 
@@ -234,7 +270,7 @@ class ESP32Controller:
         """
         try:
             self._send_and_wait(
-                protocol.build_trajectory_begin(len(deltas)),
+                protocol.build_trajectory_begin(len(deltas), timed=timed),
                 expected_kinds=["TRAJ_READY"],
                 timeout=timeout_per_point,
             )
@@ -244,10 +280,10 @@ class ESP32Controller:
             )
 
         acknowledged = 0
-        for delta in deltas:
+        for index, delta in enumerate(deltas):
             try:
                 self._send_and_wait(
-                    protocol.build_trajectory_step_point(delta),
+                    protocol.build_trajectory_step_point(index, delta),
                     expected_kinds=["ACK"],
                     timeout=timeout_per_point,
                 )
@@ -274,7 +310,7 @@ class ESP32Controller:
     # Execution (asynchronous — returns immediately)
     # ------------------------------------------------------------------
 
-    def run(self, timeout: float = DEFAULT_TIMEOUT) -> None:
+    def run(self, timed: bool = True, timeout: float = DEFAULT_TIMEOUT) -> None:
         """
         Start executing the previously stored trajectory.
 
@@ -282,19 +318,29 @@ class ESP32Controller:
         started), NOT until it finishes. Completion is reported later
         via on_trajectory_finished.
 
+        Args:
+            timed: Must match exactly the `timed` value passed to the
+                send_trajectory() call that stored this trajectory (see
+                docs/protocol.md, "TRAJ_BEGIN/RUN con tipo") — the ESP32
+                cross-checks this against what TRAJ_BEGIN announced and
+                rejects a mismatch with ERROR:TYPE_MISMATCH.
+
         Raises:
             DeviceReportedError: If the ESP32 refuses to start (e.g. no
-                trajectory stored, invalid state).
+                trajectory stored, invalid state, type mismatch).
             TimeoutWaitingForResponseError: If RUNNING is not confirmed.
         """
         self._send_and_wait(
-            protocol.build_run(), expected_kinds=["RUNNING"], timeout=timeout
+            protocol.build_run(timed=timed), expected_kinds=["RUNNING"], timeout=timeout
         )
         # FINISHED (or an ERROR) will arrive later and is handled by
         # _handle_line() as an unsolicited message -> on_trajectory_finished.
+        self._finished_notified = False
+        self._start_status_polling()
 
     def pause(self, timeout: float = DEFAULT_TIMEOUT) -> None:
         """Pause an in-progress trajectory execution."""
+        self._stop_status_polling()
         self._send_and_wait(
             protocol.build_pause(), expected_kinds=["PAUSED"], timeout=timeout
         )
@@ -304,6 +350,7 @@ class ESP32Controller:
         self._send_and_wait(
             protocol.build_resume(), expected_kinds=["RUNNING"], timeout=timeout
         )
+        self._start_status_polling()
 
     def abort(self, timeout: float = DEFAULT_TIMEOUT) -> None:
         """
@@ -316,9 +363,117 @@ class ESP32Controller:
             DeviceReportedError: If not currently paused.
             TimeoutWaitingForResponseError: If no response arrives.
         """
+        self._stop_status_polling()
         self._send_and_wait(
             protocol.build_abort(), expected_kinds=["ABORTED"], timeout=timeout
         )
+
+    # ------------------------------------------------------------------
+    # Internal: TRAJ_STATUS polling (robustness backstop for FINISHED)
+    # ------------------------------------------------------------------
+
+    def _start_status_polling(self) -> None:
+        """
+        Spawns a new background thread that queries <TRAJ_STATUS> every
+        `_status_poll_interval` seconds. Called right after RUNNING is
+        confirmed by run() or resume() — see docs/protocol.md,
+        "TRAJ_STATUS". Safe to call even if a previous poller is still
+        winding down: bumping the generation counter makes it a no-op
+        on its next check (see _status_poll_loop).
+        """
+        with self._status_poll_lock:
+            self._status_poll_generation += 1
+            generation = self._status_poll_generation
+        thread = threading.Thread(
+            target=self._status_poll_loop,
+            args=(generation,),
+            daemon=True,
+            name="TrajStatusPoller",
+        )
+        thread.start()
+
+    def _stop_status_polling(self) -> None:
+        """
+        Signals any currently running poller to stop, without blocking
+        to join it (join() here could deadlock if called FROM the
+        poller thread itself, e.g. when it's the one that just detected
+        FINISHED/PAUSED/ABORTED — see _status_poll_loop). The loop
+        checks the generation counter at each 1s wake-up and after each
+        TRAJ_STATUS reply, so a superseded thread exits within at most
+        one poll cycle without sending anything further.
+        """
+        with self._status_poll_lock:
+            self._status_poll_generation += 1
+
+    def _status_poll_loop(self, generation: int) -> None:
+        """
+        Runs on its own thread. Sends <TRAJ_STATUS> once per
+        `_status_poll_interval`, for as long as this thread's
+        `generation` is still the current one (see _start_status_polling/
+        _stop_status_polling) and the ESP32 keeps reporting RUNNING.
+
+        This is purely a REDUNDANT completion check — the normal
+        unsolicited FINISHED (handled in _handle_line) is still the
+        primary, fastest path; this loop exists so a run still gets
+        detected as finished (within ~1s) even if that line is ever
+        dropped or corrupted on the wire. Applies to every trajectory
+        run through run()/resume() alike, whether TRAJ_POINT was sent
+        with or without dt_ms — TRAJ_STATUS is independent of that.
+
+        A TRAJ_STATUS exchange that times out or gets ERROR (e.g. older
+        firmware that doesn't recognize the command yet) is treated as
+        "try again next cycle", not a fatal condition — this loop must
+        never itself raise into the caller, since nothing is waiting on
+        it synchronously.
+        """
+        while True:
+            time.sleep(self._status_poll_interval)
+            with self._status_poll_lock:
+                if generation != self._status_poll_generation:
+                    return
+
+            try:
+                response = self._send_and_wait(
+                    protocol.build_traj_status(),
+                    expected_kinds=["RUNNING", "FINISHED", "PAUSED", "ABORTED"],
+                    timeout=self.DEFAULT_TIMEOUT,
+                )
+            except ESP32ControllerError:
+                # Timeout, device error (e.g. UNKNOWN_COMMAND on
+                # firmware without TRAJ_STATUS yet), or a send failure —
+                # just retry on the next cycle rather than giving up.
+                continue
+
+            with self._status_poll_lock:
+                if generation != self._status_poll_generation:
+                    return
+
+            if response.kind == "FINISHED":
+                self._notify_finished_once()
+                return
+            if response.kind in ("PAUSED", "ABORTED"):
+                # Execution already left RUNNING through some other,
+                # already-handled path (explicit pause()/abort(), which
+                # each stop polling themselves) — nothing left to poll.
+                return
+            # response.kind == "RUNNING": keep polling.
+
+    def _notify_finished_once(self) -> None:
+        """
+        Fires on_trajectory_finished at most once per run() (reset by
+        run() itself, see its `_finished_notified = False`) — shared by
+        both the unsolicited-FINISHED path in _handle_line and this
+        poller's own FINISHED detection, so a trajectory that completes
+        with an intact wire message never double-fires the callback
+        just because the poller's TRAJ_STATUS reply happened to arrive
+        around the same time.
+        """
+        with self._finished_notify_lock:
+            if self._finished_notified:
+                return
+            self._finished_notified = True
+        if self.on_trajectory_finished is not None:
+            self.on_trajectory_finished()
 
     # ------------------------------------------------------------------
     # Internal: send-and-wait mechanism
@@ -386,8 +541,8 @@ class ESP32Controller:
 
         # Unsolicited messages: not what any pending call is waiting for.
         if response.kind == "FINISHED":
-            if self.on_trajectory_finished is not None:
-                self.on_trajectory_finished()
+            self._stop_status_polling()
+            self._notify_finished_once()
         elif response.kind == "TRAJ_PROGRESS":
             if self.on_trajectory_progress is not None:
                 point = protocol.parse_trajectory_progress(response.payload)
@@ -408,6 +563,7 @@ class ESP32Controller:
 
     def _handle_disconnected(self) -> None:
         """Called by SerialManager if the connection is unexpectedly lost."""
+        self._stop_status_polling()
         self._response_event.set()  # unblock any pending wait immediately
         if self.on_disconnected is not None:
             self.on_disconnected()

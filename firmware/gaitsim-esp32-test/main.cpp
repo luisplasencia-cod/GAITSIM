@@ -222,22 +222,40 @@ void handleGetPosition() {
                ":" + String(posAngleSteps));
 }
 
+// Type of the trajectory currently being received/stored — set by
+// handleTrajBegin(), consulted by handleTrajPoint() (to know whether to
+// parse 3 or 4 fields) and handleRun() (to cross-check RUN's own tipo
+// against it). 2026-09-01, "TRAJ_BEGIN/RUN con tipo" — see
+// docs/protocol.md. true = TIMED (tipo 1), false = UNTIMED (tipo 2).
+bool trajectoryIsTimed = true;
+
 void handleTrajBegin(const String &line) {
   if (currentState != STATE_IDLE) {
     sendError("INVALID_STATE", "cannot begin trajectory in current state");
     return;
   }
-  String parts[2];
-  int n = splitCommand(line, parts, 2);
-  if (n != 2) {
-    sendError("MALFORMED", "expected TRAJ_BEGIN:<n_points>");
+  // Format (2026-09-01): TRAJ_BEGIN:<tipo>:<n_points> — tipo=1 CON
+  // tiempo (el TRAJ_POINT que sigue trae 4 campos: dt_ms:dx:dy:dangle),
+  // tipo=2 SIN tiempo (3 campos: dx:dy:dangle). Lets this firmware know
+  // in advance which TRAJ_POINT shape to expect, instead of inferring
+  // it per-line from how many ':'-separated fields arrive.
+  String parts[3];
+  int n = splitCommand(line, parts, 3);
+  if (n != 3) {
+    sendError("MALFORMED", "expected TRAJ_BEGIN:<tipo>:<n_points>");
     return;
   }
-  int n_points = parts[1].toInt();
+  int tipo = parts[1].toInt();
+  if (tipo != 1 && tipo != 2) {
+    sendError("INVALID_TYPE", String(tipo));
+    return;
+  }
+  int n_points = parts[2].toInt();
   if (n_points <= 0 || n_points > MAX_TRAJECTORY_POINTS) {
     sendError("INVALID_POINT_COUNT", String(n_points));
     return;
   }
+  trajectoryIsTimed = (tipo == 1);
   expectedPointCount = n_points;
   receivedPointCount = 0;
   trajectoryStored = false;
@@ -260,20 +278,63 @@ void handleTrajPoint(const String &line) {
     sendError("POINT_COUNT_MISMATCH", "received more points than announced");
     return;
   }
-  // Format (2026-08-26): TRAJ_POINT:<dt_ms>:<dx_steps>:<dy_steps>:<dangle_steps>
-  // — a signed step DELTA from the previous point (or from the current
-  // tracked position, for the first point), NOT an absolute position
-  // (see docs/protocol.md, "Cambio 2026-08-26 (trayectorias en pasos)").
-  String parts[5];
-  int n = splitCommand(line, parts, 5);
-  if (n != 5) {
-    sendError("MALFORMED", "expected TRAJ_POINT:<dt_ms>:<dx>:<dy>:<dangle>");
+  // Shape depends on trajectoryIsTimed, set by the TRAJ_BEGIN that
+  // started this transfer (see docs/protocol.md, "Cambio 2026-08-26
+  // (trayectorias en pasos)", "Cambio 2026-08-31 (TRAJ_POINT sin
+  // tiempo)" and "Cambio 2026-09-01 (TRAJ_POINT con índice)"): TIMED ->
+  // TRAJ_POINT:<index>:<dt_ms>:<dx>:<dy>:<dangle> (6 fields incl.
+  // command); UNTIMED -> TRAJ_POINT:<index>:<dx>:<dy>:<dangle> (5
+  // fields incl. command). `index` is always the FIRST argument, in
+  // both forms — this point's own 0-based position within the current
+  // transfer, matching TRAJ_BEGIN's n_points (0..n_points-1). The
+  // dx/dy/dangle fields (and dt_ms, when present) are still signed step
+  // DELTAs from the previous point (or from the current tracked
+  // position, for the first point), NOT an absolute position,
+  // accumulated the same way either way.
+  int index;
+  unsigned long dtMs;
+  long dxSteps, dySteps, dangleSteps;
+  if (trajectoryIsTimed) {
+    String parts[6];
+    int n = splitCommand(line, parts, 6);
+    if (n != 6) {
+      sendError("MALFORMED", "expected TRAJ_POINT:<index>:<dt_ms>:<dx>:<dy>:<dangle>");
+      return;
+    }
+    index = parts[1].toInt();
+    dtMs = (unsigned long)parts[2].toInt();
+    dxSteps = parts[3].toInt();
+    dySteps = parts[4].toInt();
+    dangleSteps = parts[5].toInt();
+  } else {
+    String parts[5];
+    int n = splitCommand(line, parts, 5);
+    if (n != 5) {
+      sendError("MALFORMED", "expected TRAJ_POINT:<index>:<dx>:<dy>:<dangle>");
+      return;
+    }
+    index = parts[1].toInt();
+    // UNTIMED: the ESP32 picks its own speed (no recorded gait timing
+    // to honor) — this test firmware still paces itself with the same
+    // fixed 120ms TEST-ONLY cadence handleRun() always used, so dtMs
+    // here only feeds TRAJ_PROGRESS's `t` value; kept at 0 since there
+    // is no real per-point duration for an untimed move.
+    dtMs = 0;
+    dxSteps = parts[2].toInt();
+    dySteps = parts[3].toInt();
+    dangleSteps = parts[4].toInt();
+  }
+
+  // Robustness cross-check (2026-09-01): the index the RPi claims for
+  // this point must exactly match how many we've already received —
+  // catches a dropped/reordered/duplicated TRAJ_POINT independently of
+  // the total-count check TRAJ_END already does.
+  if (index != receivedPointCount) {
+    sendError("POINT_INDEX_MISMATCH",
+               "expected index " + String(receivedPointCount) +
+               ", got " + String(index));
     return;
   }
-  unsigned long dtMs = (unsigned long)parts[1].toInt();
-  long dxSteps = parts[2].toInt();
-  long dySteps = parts[3].toInt();
-  long dangleSteps = parts[4].toInt();
 
   trajAccumXSteps += dxSteps;
   trajAccumYSteps += dySteps;
@@ -302,11 +363,33 @@ void handleTrajEnd() {
   sendResponse("TRAJ_STORED");
 }
 
-void handleRun() {
+void handleRun(const String &line) {
   if (currentState != STATE_IDLE || !trajectoryStored) {
     sendError("INVALID_STATE", "no trajectory stored or system not idle");
     return;
   }
+  // Format (2026-09-01): RUN:<tipo> — same codes as TRAJ_BEGIN's own
+  // tipo (1 CON tiempo, 2 SIN tiempo). Cross-checked against
+  // trajectoryIsTimed (set by the TRAJ_BEGIN that stored this
+  // trajectory) as a robustness belt — see docs/protocol.md,
+  // "TRAJ_BEGIN/RUN con tipo".
+  String parts[2];
+  int n = splitCommand(line, parts, 2);
+  if (n != 2) {
+    sendError("MALFORMED", "expected RUN:<tipo>");
+    return;
+  }
+  int tipo = parts[1].toInt();
+  if (tipo != 1 && tipo != 2) {
+    sendError("INVALID_TYPE", String(tipo));
+    return;
+  }
+  bool runTimed = (tipo == 1);
+  if (runTimed != trajectoryIsTimed) {
+    sendError("TYPE_MISMATCH", "RUN tipo does not match TRAJ_BEGIN tipo");
+    return;
+  }
+
   currentState = STATE_RUNNING;
   sendResponse("RUNNING");
 
@@ -379,6 +462,35 @@ void handleRun() {
   sendResponse("FINISHED");
 }
 
+// 2026-09-01: robustness backstop so the RPi doesn't rely SOLELY on the
+// unsolicited FINISHED line arriving intact — see docs/protocol.md,
+// "TRAJ_STATUS". ESP32Controller (RPi side) polls this every 1s while
+// RUNNING/PAUSED. Reuses the SAME keywords as the unsolicited execution-
+// status messages (RUNNING/FINISHED/PAUSED/ABORTED) — no new response
+// format. Non-blocking: just reports currentState, doesn't wait for
+// anything, so it's safe to answer from inside handleRun()'s nested
+// pollSerial() calls the same way PAUSE/RESUME already are.
+void handleTrajStatus() {
+  switch (currentState) {
+    case STATE_RUNNING:
+      sendResponse("RUNNING");
+      break;
+    case STATE_PAUSED:
+      sendResponse("PAUSED");
+      break;
+    case STATE_IDLE:
+      // Polling only ever happens between RUNNING and a terminal
+      // outcome (see ESP32Controller._status_poll_loop) — reaching
+      // IDLE while that's true means the run just completed normally.
+      // ABORT has its own explicit synchronous ABORTED response, so
+      // IDLE here is unambiguous.
+      sendResponse("FINISHED");
+      break;
+    default:
+      sendError("INVALID_STATE", "no trajectory execution in progress");
+  }
+}
+
 void handlePause() {
   if (currentState == STATE_RUNNING) {
     currentState = STATE_PAUSED;
@@ -425,7 +537,8 @@ void processLine(const String &line) {
   else if (line.startsWith("TRAJ_BEGIN")) handleTrajBegin(line);
   else if (line.startsWith("TRAJ_POINT")) handleTrajPoint(line);
   else if (line.startsWith("TRAJ_END")) handleTrajEnd();
-  else if (line.startsWith("RUN")) handleRun();
+  else if (line.startsWith("TRAJ_STATUS")) handleTrajStatus();
+  else if (line.startsWith("RUN")) handleRun(line);
   else if (line.startsWith("PAUSE")) handlePause();
   else if (line.startsWith("RESUME")) handleResume();
   else if (line.startsWith("ABORT")) handleAbort();

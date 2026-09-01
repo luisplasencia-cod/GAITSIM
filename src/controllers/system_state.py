@@ -107,6 +107,64 @@ class InvalidTransitionError(Exception):
     pass
 
 
+class TrajectorySpeedExceededError(Exception):
+    """
+    Raised by _points_to_step_deltas when one or more points would
+    require moving an axis faster than MAX_SPEED_X_CM_S/MAX_SPEED_Y_CM_S/
+    MAX_SPEED_ANGLE_DEG_S allow. Added 2026-09-01 after a real vertical-
+    axis overspeed (measured from logs/gaitsim.log: ~90 cm/s at the
+    default 30x time scale, ~2700 cm/s at a 1x scale) — caused by the
+    initial-position session (InitialPositionSession) no longer matching
+    the ESP32's actual position when "Load && Send" ran, so the offset
+    trajectory's own first point carried a huge, unintended correction
+    delta and — being a TIMED ensayo point — that correction was executed
+    at the CSV's recorded speed instead of a safe one.
+
+    Checked for EVERY point (not just the first), but ONLY for TIMED
+    sends (`timed=True`, i.e. the CSV/gait ensayo) — per Luis's explicit
+    call: for UNTIMED trajectories (joystick, synchronized initial move,
+    safe return, "Reiniciar Ensayo") dt_ms is never actually sent on the
+    wire (see _points_to_step_deltas), it's only an RPi-side placeholder
+    derived from trajectory_generator.py's assumed speed constants — the
+    ESP32 firmware picks its own real execution speed for those (see
+    docs/protocol.md, "Cambio 2026-08-31"), which is the teammate's
+    firmware's responsibility to keep safe, not a number worth enforcing
+    against here. Only the timed ensayo's dt_ms is a real commitment the
+    RPi controls, so only it gets this check.
+    """
+
+    MAX_LISTED = 5
+
+    def __init__(self, violations: List["SpeedViolation"]):
+        self.violations = violations
+        lines = []
+        for v in violations[: self.MAX_LISTED]:
+            lines.append(
+                f"Punto {v.index} (t={v.t:g}s): {v.axis_label} a "
+                f"{v.speed:.1f}{v.unit}/s (máx {v.limit:.1f}{v.unit}/s)"
+            )
+        remaining = len(violations) - self.MAX_LISTED
+        if remaining > 0:
+            lines.append(f"... y {remaining} violación(es) más")
+        message = (
+            f"{len(violations)} punto(s) exceden la velocidad máxima "
+            f"segura:\n" + "\n".join(lines)
+        )
+        super().__init__(message)
+
+
+@dataclass
+class SpeedViolation:
+    """One axis of one point implying a speed beyond its MAX_SPEED_*
+    limit — see TrajectorySpeedExceededError."""
+    index: int
+    t: float
+    axis_label: str
+    unit: str
+    speed: float
+    limit: float
+
+
 class SystemStateMachine:
     """
     Tracks and controls transitions of the simulator's operational state.
@@ -137,6 +195,28 @@ class SystemStateMachine:
         self._lock = threading.Lock()
         # True once HOME has succeeded this session — see can_home().
         self._homed = False
+        # Whether the trajectory most recently transferred via
+        # send_trajectory() was TIMED (see that method's `timed` param)
+        # — remembered here so run() can pass the SAME value on to
+        # ESP32Controller.run(), which announces it to the ESP32 as
+        # RUN's own `tipo` (2026-09-01, "TRAJ_BEGIN/RUN con tipo", see
+        # docs/protocol.md). Always set by send_trajectory() right
+        # before the RUN that actually executes it (send_trajectory ->
+        # run() is always the very next call for a given trajectory —
+        # the state machine won't allow another send_trajectory() while
+        # RUNNING/PAUSED), so it's never stale at the point run() reads
+        # it. Default True only matters if run() were ever (incorrectly)
+        # called with nothing transferred first — the ESP32 would reject
+        # that anyway (no trajectory stored).
+        self._last_trajectory_timed = True
+
+        # Max per-axis speed reached by the most recent send_trajectory()
+        # call's points, computed in _points_to_step_deltas regardless of
+        # whether that call succeeded or raised TrajectorySpeedExceededError
+        # — read by TrajectoryScreen to show a "Vel. máx" readout right
+        # after Load && Send (see docs/protocol.md history above,
+        # TrajectorySpeedExceededError). (x_cm_s, y_cm_s, angle_deg_s).
+        self._last_trajectory_max_speeds = (0.0, 0.0, 0.0)
 
         self.on_state_changed: Optional[Callable[[SystemState], None]] = None
         self.on_trajectory_finished: Optional[Callable[[], None]] = None
@@ -162,6 +242,17 @@ class SystemStateMachine:
     def state(self) -> SystemState:
         """The current system state."""
         return self._state
+
+    @property
+    def last_trajectory_max_speeds(self) -> tuple:
+        """
+        (x_cm_s, y_cm_s, angle_deg_s) — the max per-axis speed implied by
+        the most recently attempted send_trajectory() call's points, set
+        by _points_to_step_deltas whether that call succeeded or was
+        rejected by TrajectorySpeedExceededError. (0.0, 0.0, 0.0) if no
+        trajectory has been sent this session.
+        """
+        return self._last_trajectory_max_speeds
 
     # ------------------------------------------------------------------
     # Query methods — used by the UI to decide what to show/enable
@@ -402,14 +493,28 @@ class SystemStateMachine:
 
         Raises:
             InvalidTransitionError: If not currently idle.
+            TrajectorySpeedExceededError: Only when `timed=True` (the
+                CSV/gait ensayo) — if any point implies a per-axis speed
+                beyond MAX_SPEED_X_CM_S/MAX_SPEED_Y_CM_S/
+                MAX_SPEED_ANGLE_DEG_S, nothing is transmitted (see
+                _points_to_step_deltas). Never raised for `timed=False`.
         """
         if not self.can_send_trajectory():
             raise InvalidTransitionError(
                 f"Cannot send trajectory while in state {self._state.name}."
             )
         self._set_state(SystemState.RECEIVING_TRAJECTORY)
-        deltas = self._points_to_step_deltas(points, timed=timed)
-        result = self._controller.send_trajectory(deltas)
+        try:
+            deltas = self._points_to_step_deltas(points, timed=timed)
+        except TrajectorySpeedExceededError:
+            # Nothing was transmitted (the check runs before any wire
+            # traffic) — roll back exactly like a failed run() does.
+            self._set_state(SystemState.IDLE)
+            raise
+        result = self._controller.send_trajectory(deltas, timed=timed)
+        # Remembered for the run() that must immediately follow a
+        # successful transfer — see this attribute's own docstring.
+        self._last_trajectory_timed = timed
         self._set_state(SystemState.IDLE)
         return result
 
@@ -456,6 +561,21 @@ class SystemStateMachine:
         == 0.0 — TRAJ_BEGIN's n_points (computed downstream from
         len(deltas)) reflects this automatically.
 
+        Also enforces MAX_SPEED_X_CM_S/MAX_SPEED_Y_CM_S/
+        MAX_SPEED_ANGLE_DEG_S on every point (including the first sent
+        one, computed against `current` same as above) — but ONLY when
+        `timed=True` (the CSV/gait ensayo); see TrajectorySpeedExceededError's
+        docstring for why untimed sends are exempt. Raises
+        TrajectorySpeedExceededError, listing every offending point, if
+        any axis of any point implies a speed beyond its limit. This is
+        the single choke point for that check since it's the one place
+        that already computes every point's dx/dy/dangle/dt_ms
+        regardless of trajectory type. self._last_trajectory_max_speeds
+        is still updated for BOTH timed and untimed sends (informational
+        only for untimed — see TrajectoryScreen's readout), and BEFORE
+        raising, so a rejected trajectory's speed is still visible to
+        the caller.
+
         Rounds each point's ABSOLUTE step position first, then takes
         the difference between consecutive ROUNDED absolute values —
         never rounds a delta independently — so rounding error never
@@ -483,15 +603,60 @@ class SystemStateMachine:
         prev_t_ms, prev_x, prev_y, prev_a = to_steps(0.0, current.x, current.y, current.angle)
 
         deltas = []
+        violations: List[SpeedViolation] = []
+        max_speed_x = max_speed_y = max_speed_angle = 0.0
         for point in points:
             t_ms, x, y, a = to_steps(point.t, point.x, point.y, point.angle)
+            dt_ms = t_ms - prev_t_ms
+            dx_steps, dy_steps, dangle_steps = x - prev_x, y - prev_y, a - prev_a
             deltas.append(TrajectoryStepDelta(
-                dt_ms=(t_ms - prev_t_ms) if timed else None,
-                dx_steps=x - prev_x,
-                dy_steps=y - prev_y,
-                dangle_steps=a - prev_a,
+                dt_ms=dt_ms if timed else None,
+                dx_steps=dx_steps,
+                dy_steps=dy_steps,
+                dangle_steps=dangle_steps,
             ))
+            # dt_ms<=0 is a separate, pre-existing concern (see the
+            # docstring above on the dropped t=0 baseline) — not this
+            # check's job, and dividing by it here would only raise
+            # ZeroDivisionError/produce a bogus infinite speed.
+            if dt_ms > 0:
+                dt_s = dt_ms / 1000.0
+                speed_x = abs(dx_steps) / self.STEPS_PER_CM_X / dt_s
+                speed_y = abs(dy_steps) / self.STEPS_PER_CM_Y / dt_s
+                speed_angle = abs(dangle_steps) / self.STEPS_PER_DEG_ANGLE / dt_s
+                max_speed_x = max(max_speed_x, speed_x)
+                max_speed_y = max(max_speed_y, speed_y)
+                max_speed_angle = max(max_speed_angle, speed_angle)
+                # Enforced ONLY for TIMED sends (the CSV/gait ensayo).
+                # For untimed ones (joystick, posición inicial, retorno
+                # seguro, Reiniciar Ensayo) dt_ms here is never sent on
+                # the wire at all (see dt_ms=None below) — it's only a
+                # placeholder derived from trajectory_generator.py's
+                # assumed speed constants, not a real commitment. The
+                # ESP32 picks its own actual speed for those (per
+                # docs/protocol.md, "Cambio 2026-08-31") — per Luis,
+                # that's the teammate's firmware's job to keep safe, not
+                # ours to second-guess with a fictional RPi-side number.
+                if timed:
+                    index = len(deltas) - 1
+                    if speed_x > self.MAX_SPEED_X_CM_S:
+                        violations.append(SpeedViolation(
+                            index, point.t, "X", "cm", speed_x, self.MAX_SPEED_X_CM_S,
+                        ))
+                    if speed_y > self.MAX_SPEED_Y_CM_S:
+                        violations.append(SpeedViolation(
+                            index, point.t, "Y", "cm", speed_y, self.MAX_SPEED_Y_CM_S,
+                        ))
+                    if speed_angle > self.MAX_SPEED_ANGLE_DEG_S:
+                        violations.append(SpeedViolation(
+                            index, point.t, "Ángulo", "°", speed_angle,
+                            self.MAX_SPEED_ANGLE_DEG_S,
+                        ))
             prev_t_ms, prev_x, prev_y, prev_a = t_ms, x, y, a
+
+        self._last_trajectory_max_speeds = (max_speed_x, max_speed_y, max_speed_angle)
+        if violations:
+            raise TrajectorySpeedExceededError(violations)
         return deltas
 
     def run(self) -> None:
@@ -499,6 +664,13 @@ class SystemStateMachine:
         Start executing the stored trajectory. Transitions to RUNNING
         immediately; the eventual transition back to IDLE happens
         automatically when FINISHED is received (see _on_finished).
+
+        Passes `_last_trajectory_timed` (set by the send_trajectory()
+        call that must have immediately preceded this one) down to
+        ESP32Controller.run() as its own `timed` argument — the ESP32
+        cross-checks this against what TRAJ_BEGIN announced for the
+        same trajectory (see docs/protocol.md, "TRAJ_BEGIN/RUN con
+        tipo") and rejects a mismatch with ERROR:TYPE_MISMATCH.
 
         Raises:
             InvalidTransitionError: If not currently idle.
@@ -510,7 +682,7 @@ class SystemStateMachine:
                 f"Cannot run while in state {self._state.name}."
             )
         try:
-            self._controller.run()
+            self._controller.run(timed=self._last_trajectory_timed)
         except Exception:
             # run() failed to even start; state remains IDLE.
             raise
@@ -743,6 +915,26 @@ class SystemStateMachine:
     STEPS_PER_CM_X = (10 * _X_STEPS_PER_REV) / _LEADSCREW_X_MM_PER_REV
     STEPS_PER_CM_Y = (10 * _Y_STEPS_PER_REV) / _LEADSCREW_Y_MM_PER_REV
     STEPS_PER_DEG_ANGLE = (_K_GEAR_RATIO * _K_STEPS_PER_REV) / 360
+
+    # Hard per-axis speed ceiling enforced on EVERY point of TIMED
+    # sends only (the CSV/gait ensayo — see
+    # _points_to_step_deltas/TrajectorySpeedExceededError) — added
+    # 2026-09-01 after a real Y-axis overspeed incident (see that
+    # exception's docstring). Deliberately NOT enforced on untimed
+    # sends (joystick, posición inicial, retorno seguro, "Reiniciar
+    # Ensayo") per Luis: the ESP32/teammate's firmware picks its own
+    # speed for those, so an RPi-side ceiling would be checking a
+    # fictional number, not a real one. Placeholder, like
+    # STEPS_PER_CM_X/Y above, pending real rig calibration: derived
+    # from this real ensayo's own normal (non-defective) per-point
+    # speed profile, re-scaled from the 30x default time scale down to
+    # 13x (a deliberately conservative floor above the 1x scale that
+    # tripped a real motor stall, still comfortably above 25x/30x,
+    # which tested fine) — NOT a measured motor/driver spec. Revisit
+    # once real max-speed numbers are known.
+    MAX_SPEED_X_CM_S = 15.0
+    MAX_SPEED_Y_CM_S = 3.0
+    MAX_SPEED_ANGLE_DEG_S = 35.0
 
     def _build_calibration_space(self, limits: HomeLimits) -> CalibrationSpace:
         """Converts a HOME's raw-step HomeLimits (from

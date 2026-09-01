@@ -47,14 +47,32 @@ CMD_MANUAL = "MANUAL"        # MANUAL:<axis>:<direction>:<steps>
 # (X_POSITIVE_DIR = 1, etc.) for consistency between the two protocols.
 _DIRECTION_WIRE_CODE = {"+": 1, "-": 0}
 
-CMD_TRAJ_BEGIN = "TRAJ_BEGIN"   # TRAJ_BEGIN:<n_points>
-CMD_TRAJ_POINT = "TRAJ_POINT"   # TRAJ_POINT:<t>:<x>:<y>:<angle>
+CMD_TRAJ_BEGIN = "TRAJ_BEGIN"   # TRAJ_BEGIN:<tipo>:<n_points>
+CMD_TRAJ_POINT = "TRAJ_POINT"   # TRAJ_POINT:<index>:[<dt_ms>:]<x>:<y>:<angle>
 CMD_TRAJ_END = "TRAJ_END"
 
-CMD_RUN = "RUN"
+# Shared type code (2026-09-01, "TRAJ_BEGIN/RUN con tipo") announced by
+# BOTH TRAJ_BEGIN and RUN — see docs/protocol.md. Lets the firmware know
+# in advance which TRAJ_POINT shape the whole trajectory will use
+# (rather than inferring it per-line from how many ':'-separated fields
+# arrive), and lets RUN cross-check that it's starting the trajectory
+# type it thinks it is (a robustness belt, same spirit as TRAJ_STATUS
+# below) — a mismatch is reported as ERROR:TYPE_MISMATCH.
+TRAJ_TYPE_TIMED = 1     # TRAJ_POINT will carry dt_ms (4 fields)
+TRAJ_TYPE_UNTIMED = 2   # TRAJ_POINT will NOT carry dt_ms (3 fields)
+
+CMD_RUN = "RUN"         # RUN:<tipo>
 CMD_PAUSE = "PAUSE"
 CMD_RESUME = "RESUME"
 CMD_ABORT = "ABORT"     # abandon a PAUSED trajectory entirely -> IDLE
+
+# Actively queries execution status while RUNNING/PAUSED (2026-09-01,
+# see docs/protocol.md "TRAJ_STATUS") — a robustness backstop so the RPi
+# doesn't rely SOLELY on the unsolicited FINISHED arriving intact over
+# the wire. Response reuses the SAME keywords as the unsolicited
+# execution-status messages (RUNNING/FINISHED/PAUSED/ABORTED) — no new
+# response format, see RESP_* below and parse_response().
+CMD_TRAJ_STATUS = "TRAJ_STATUS"
 
 CMD_GET_POSITION = "GET_POSITION"
 
@@ -266,42 +284,65 @@ def build_manual_move(axis: str, direction: str, steps: int) -> str:
     return f"<{CMD_MANUAL}:{axis}:{_DIRECTION_WIRE_CODE[direction]}:{steps}>"
 
 
-def build_trajectory_begin(n_points: int) -> str:
+def build_trajectory_begin(n_points: int, timed: bool = True) -> str:
     """
-    Build a TRAJ_BEGIN command frame, announcing how many points will follow.
+    Build a TRAJ_BEGIN command frame, announcing the trajectory's type
+    and how many points will follow (2026-09-01, "TRAJ_BEGIN con tipo" —
+    see docs/protocol.md).
 
     Args:
         n_points: Number of TrajectoryPoint entries that will be sent
                   afterwards. Must match exactly what is sent, or the
                   ESP32 will respond with an error at TRAJ_END.
+        timed: True (default) announces TRAJ_TYPE_TIMED — every
+            following TRAJ_POINT will carry dt_ms (4 fields). False
+            announces TRAJ_TYPE_UNTIMED — every following TRAJ_POINT
+            will have 3 fields, no dt_ms. MUST match exactly what
+            build_trajectory_step_point() actually builds for each
+            following delta (see TrajectoryStepDelta.dt_ms) and what
+            build_run() announces for the same trajectory — a mismatch
+            is a caller bug, not something this function can catch.
     """
     if n_points <= 0:
         raise ValueError(f"n_points must be positive, got {n_points}.")
-    return f"<{CMD_TRAJ_BEGIN}:{n_points}>"
+    tipo = TRAJ_TYPE_TIMED if timed else TRAJ_TYPE_UNTIMED
+    return f"<{CMD_TRAJ_BEGIN}:{tipo}:{n_points}>"
 
 
-def build_trajectory_step_point(delta: TrajectoryStepDelta) -> str:
+def build_trajectory_step_point(index: int, delta: TrajectoryStepDelta) -> str:
     """
     Build a TRAJ_POINT command frame for a single wire-level trajectory
     delta (see TrajectoryStepDelta, docs/protocol.md "Cambio 2026-08-26
-    (trayectorias en pasos)" and "Cambio 2026-08-31 (TRAJ_POINT sin
-    tiempo)"). All fields are plain integers (no decimals — dt_ms, when
-    present, and every step count are already whole numbers by the time
-    they reach here).
+    (trayectorias en pasos)", "Cambio 2026-08-31 (TRAJ_POINT sin
+    tiempo)", and "Cambio 2026-09-01 (TRAJ_POINT con índice)"). All
+    fields are plain integers (no decimals — dt_ms, when present, and
+    every step count are already whole numbers by the time they reach
+    here).
 
-    `delta.dt_ms is None` builds the UNTIMED 3-field form
-    (`TRAJ_POINT:dx:dy:dangle`, ESP32 picks its own speed); otherwise
-    the TIMED 4-field form (`TRAJ_POINT:dt_ms:dx:dy:dangle`), used only
-    for the CSV/gait ensayo.
+    Args:
+        index: This point's own 0-based position within the current
+            transfer (0..n_points-1, matching TRAJ_BEGIN's n_points) —
+            sent as the FIRST field, before dt_ms/dx/dy/dangle, in
+            BOTH the timed and untimed forms. Lets the ESP32 cross-
+            check points are arriving in order and without gaps,
+            independent of the total-count check TRAJ_END already does
+            — a robustness belt, not a new response (still just
+            `ACK:index`, which is the ESP32's OWN echo of it, a
+            different, pre-existing thing).
+        delta: `delta.dt_ms is None` builds the UNTIMED 4-field form
+            (`TRAJ_POINT:index:dx:dy:dangle`, ESP32 picks its own
+            speed); otherwise the TIMED 5-field form
+            (`TRAJ_POINT:index:dt_ms:dx:dy:dangle`), used only for the
+            CSV/gait ensayo.
     """
     if delta.dt_ms is None:
         return (
             f"<{CMD_TRAJ_POINT}:"
-            f"{delta.dx_steps}:{delta.dy_steps}:{delta.dangle_steps}>"
+            f"{index}:{delta.dx_steps}:{delta.dy_steps}:{delta.dangle_steps}>"
         )
     return (
         f"<{CMD_TRAJ_POINT}:"
-        f"{delta.dt_ms}:{delta.dx_steps}:{delta.dy_steps}:{delta.dangle_steps}>"
+        f"{index}:{delta.dt_ms}:{delta.dx_steps}:{delta.dy_steps}:{delta.dangle_steps}>"
     )
 
 
@@ -310,9 +351,21 @@ def build_trajectory_end() -> str:
     return f"<{CMD_TRAJ_END}>"
 
 
-def build_run() -> str:
-    """Build a RUN command frame (starts executing the stored trajectory)."""
-    return f"<{CMD_RUN}>"
+def build_run(timed: bool = True) -> str:
+    """
+    Build a RUN command frame (starts executing the stored trajectory),
+    announcing the SAME type code as the TRAJ_BEGIN that stored it
+    (2026-09-01, "TRAJ_BEGIN/RUN con tipo" — see docs/protocol.md and
+    TRAJ_TYPE_TIMED/TRAJ_TYPE_UNTIMED above). The firmware cross-checks
+    this against what TRAJ_BEGIN announced and rejects a mismatch with
+    ERROR:TYPE_MISMATCH — a robustness belt, not new behavior for the
+    trajectory itself. `timed` must reflect the SAME trajectory just
+    transferred via send_trajectory(); RESUME (unlike RUN) does NOT
+    take this parameter, since it continues an execution the ESP32
+    already classified at the original RUN.
+    """
+    tipo = TRAJ_TYPE_TIMED if timed else TRAJ_TYPE_UNTIMED
+    return f"<{CMD_RUN}:{tipo}>"
 
 
 def build_pause() -> str:
@@ -337,6 +390,18 @@ def build_abort() -> str:
 def build_get_position() -> str:
     """Build a GET_POSITION query frame."""
     return f"<{CMD_GET_POSITION}>"
+
+
+def build_traj_status() -> str:
+    """
+    Build a TRAJ_STATUS query frame (see CMD_TRAJ_STATUS above and
+    docs/protocol.md). Sent every 1s by ESP32Controller while a
+    trajectory is RUNNING (see its _status_poll_loop), as a redundant
+    check for completion on top of the normal unsolicited FINISHED —
+    valid for both TIMED (gait ensayo) and UNTIMED trajectories, since
+    it's independent of TRAJ_POINT's own timed/untimed shape.
+    """
+    return f"<{CMD_TRAJ_STATUS}>"
 
 
 # ---------------------------------------------------------------------------
