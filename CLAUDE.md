@@ -439,27 +439,104 @@ once it finishes, so its live position polling is visible for the
 whole move. Both changes confirmed on real hardware same day, no
 problems reported.
 
+**Status as of 2026-08-31**: several protocol changes landed, plus an
+explicit pivot away from the test firmware — see below.
+
+HOME simplified (session 1, this machine): the ESP32 no longer streams
+6 live `<LIM*MIN/MAX>` events during the calibration sweep — it reports
+all 4 limits it doesn't already know to be 0 in a single response,
+`READY:xmax:ymax:amin:amax` (raw steps, no more '<' '>' framing
+exception at all). Updated: `protocol.py` (`HomeLimits`,
+`parse_home_limits`), `esp32_controller.py` (`home()` now returns the
+limits instead of firing a per-event callback), `system_state.py`
+(`CalibrationSpace` built directly from that return value),
+`bridge.py` (removed the now-gone `calibration_limit` signal),
+`connection_screen.py`/`calibration_map_window.py` (per Luis's choice:
+a single generic "Calibrando..." message during HOMING replaces the
+old per-axis live text), and `firmware/gaitsim-esp32-test/main.cpp`.
+`docs/protocol.md` rewritten to match, and its placeholder notation
+unified (`POSITION:x:y:angle`, not `POSITION:<x>:<y>:<angle>` — no
+wire-format placeholder anywhere actually uses literal `<>` except
+command framing itself).
+
+Also this session: the teammate's definitive-firmware project (a full
+PlatformIO project, not just one file) was uploaded via zip and added
+as `firmware/platformIO_control_trayectoria/` (source only — `.pio`
+build artifacts and `.vscode` excluded via its own `.gitignore`, to
+avoid repeating the git-corruption-from-large-blobs issue below). The
+OLD single-file `firmware/Codigodemicompaneroparaelesp32.cpp` (Hard
+rule 6) was left untouched, unreconciled with the new project — both
+now exist side by side.
+
+Separately, from the Raspberry Pi (same day, different session):
+`HOME` no longer has a timeout at all (was 20s) — real calibration
+takes far longer than the test firmware's simulated sweep, so it now
+waits indefinitely for `READY`. `TRAJ_POINT` split into a TIMED form
+(4 fields incl. `dt_ms` — ONLY the CSV/gait ensayo, whose recorded
+timing is real) and an UNTIMED form (3 fields, no `dt_ms` — initial
+position, joystick, safe return between trials; the ESP32 picks its
+own speed), since the definitive firmware treats `dt_ms<=0` as a hard
+failure and the RPi's placeholder speed constants for non-gait moves
+were never real timing anyway. The leading `t=0` point is no longer
+sent as a `TRAJ_POINT` at all (it would always be a zero-duration
+delta against the RPi's own already-t=0 baseline — real mismatch vs.
+the ESP32's actual position is still captured in the first point that
+IS sent). `docs/protocol.md`, `system_state.py`, `protocol.py`,
+`esp32_controller.py`, `trajectory_generator.py`,
+`platformIO_control_trayectoria/src/communication.h` (missing trailing
+`\n` in `communication_tx`, fixed) all updated together.
+
+Verified `docs/protocol.md` against the RPi-side implementation after
+pulling the above — accurate. One real gap found and fixed:
+`firmware/gaitsim-esp32-test/main.cpp` hadn't been updated for the new
+untimed `TRAJ_POINT` form and was rejecting those moves with
+`ERROR:MALFORMED`; now accepts both forms (untimed `dt_ms` treated as
+0, harmless — only feeds `TRAJ_PROGRESS`'s `t`, and those moves aren't
+plotted anyway).
+
+Also found, but per Hard rule 6 (and Luis's explicit instruction below)
+NOT touched: the teammate's definitive-firmware upload
+(`platformIO_control_trayectoria/src/main.cpp`) implements `TRAJ_POINT`
+completely differently from `docs/protocol.md` — it expects a leading
+INDEX parameter and uses it as an array subscript
+(`gait_dt_ms[rxPacket.parameters[0]] = rxPacket.parameters[1]`, etc.),
+which the RPi never sends. It also implements `GOTO`/`GOTO_STOP`/
+`TRAJ_STATUS`, which the doc explicitly says not to implement. Not
+reconciled — see pivot below.
+
+**PIVOT (Luis's explicit instruction, 2026-08-31)**: as of today, stop
+testing against/maintaining `firmware/gaitsim-esp32-test/` — Luis is
+moving to testing against the teammate's real/definitive firmware
+instead. HOWEVER the `platformIO_control_trayectoria/` copy currently
+in this repo is itself known-STALE (not the teammate's latest, per
+Luis) — do NOT treat it as a reference, do NOT start the Horizon 2
+comment-annotation review pass (Hard rule 6) or any other firmware-side
+work, until Luis explicitly says he has an updated copy. Until then,
+the only source of truth for "what's correct" is `docs/protocol.md` +
+the RPi-side code (`protocol.py`/`esp32_controller.py`/
+`system_state.py`) — verify against those only.
+
 ## Deferred / not built yet (do not build unless explicitly asked)
 GUI polish (splash screen, branding), user management, pathology
 library, automatic reports, Digital Twin, sensor integration beyond
 current scope — all explicitly out of thesis scope per prior planning.
 ## Roadmap (two horizons — for context, not a license to skip confirmation)
 
-**Horizon 1 — CURRENT, with TEST ESP32 firmware (firmware/gaitsim-esp32-test/main.cpp):**
-Fully working RPi control app against the simulated test firmware —
+**Horizon 1 — test-firmware phase, DONE as of 2026-07-31** (see status
+block above): RPi control app against the simulated test firmware —
 connection, homing, manual movement, trajectory select/send/run, and
-live plotting (pos_x, pos_y, angle) during RUNNING — all verified on
-real hardware (real Raspberry Pi + real test ESP32), not just
-code-reviewed. This is the current active goal.
+live plotting (pos_x, pos_y, angle) during RUNNING — verified on real
+hardware (real Raspberry Pi + real test ESP32), not just code-reviewed.
 
-**Horizon 2 — FUTURE, not started, blocked on teammate's work:**
-Integration with the DEFINITIVE ESP32 firmware (controls the real
-simulator motors), built by a teammate, not yet available. Requires
-the same wire protocol (docs/protocol.md) to be honored by that
-firmware. Do NOT start any work targeting this horizon — no motor-
-specific code, no assumptions about the definitive firmware's
-internals — until explicitly told the definitive firmware exists and
-is ready to integrate.
+**Horizon 2 — CURRENT as of 2026-08-31 (pivot), but PAUSED on firmware-
+side work specifically:** Luis moved testing to the teammate's real/
+definitive firmware instead of the test firmware (see "PIVOT" in the
+status block above). A copy of that firmware
+(`firmware/platformIO_control_trayectoria/`) is in the repo but is
+explicitly known-STALE — do NOT treat it as reference, do NOT start
+the Hard-rule-6 comment-annotation review/integration pass, until Luis
+says he has an updated copy. Until then, verify/build only against
+`docs/protocol.md` + the RPi-side code, same as before.
 
 Work stage by stage within Horizon 1. For each stage: present the
 design plan first, wait for explicit confirmation, implement, then
