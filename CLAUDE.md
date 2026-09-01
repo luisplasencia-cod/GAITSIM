@@ -516,6 +516,82 @@ the only source of truth for "what's correct" is `docs/protocol.md` +
 the RPi-side code (`protocol.py`/`esp32_controller.py`/
 `system_state.py`) — verify against those only.
 
+**Status as of 2026-09-01**: four protocol/RPi-side additions this
+session, ALL still code-only — no real-hardware verification yet
+(nothing to reflash against, see PIVOT confirmation below):
+1. A configurable time-scale factor (`QDoubleSpinBox`, default 30x, no
+   upper cap) in `trajectory_screen.py`'s TRAJECTORY SELECTION box —
+   the simulator can't reproduce real gait timing yet, so the CSV
+   ensayo's own `t` values are stretched by this factor at load time
+   (`_on_send_clicked`), before offset/validation/send. Only affects
+   the TIMED ensayo; untimed sends are untouched.
+2. `<TRAJ_STATUS>`: the RPi now actively polls this every 1s while
+   RUNNING (starting right after `RUN`/`RESUME` confirms `RUNNING`,
+   stopped by `PAUSE`/`ABORT`), as a robustness backstop for a lost/
+   corrupted unsolicited `FINISHED` — same words (`RUNNING`/`PAUSED`/
+   `FINISHED`) reused, no new response shape. Lives in
+   `ESP32Controller` (background thread, generation-counter-guarded, no
+   `thread.join()` to avoid a self-join deadlock) so it applies to
+   every trajectory type with no `SystemStateMachine`/UI changes.
+3. `TRAJ_BEGIN`/`RUN` now carry a `tipo` (`1`=CON tiempo, `2`=SIN
+   tiempo) — lets the firmware know in advance which `TRAJ_POINT` shape
+   to expect instead of inferring it, and `RUN` cross-checks its own
+   `tipo` against the `TRAJ_BEGIN` that stored the trajectory
+   (`ERROR:TYPE_MISMATCH` on mismatch). `SystemStateMachine` remembers
+   the last `send_trajectory(timed=...)` value (`_last_trajectory_timed`)
+   and threads it through to `run()` automatically.
+4. `TRAJ_POINT` now carries its own 0-based `index` as the FIRST field
+   (before `dt_ms`/`dx`/`dy`/`dangle`), matching `TRAJ_BEGIN`'s
+   `n_points` — a robustness cross-check independent of the total-count
+   check `TRAJ_END` already does (`ERROR:POINT_INDEX_MISMATCH` on a
+   mismatch). Distinct from `ACK:index`, the ESP32's own pre-existing
+   response.
+
+All 4 verified OFFSCREEN only (mocked serial transport / mocked
+controller — no real ESP32), same spirit as prior sessions' "verified
+with a mocked controller" entries: wire-format strings, poll cadence,
+no-double-fire on a race between the two FINISHED-detection paths,
+pause/resume stopping/restarting the poller, and `timed` propagating
+end-to-end from `send_trajectory()` to `run()`.
+
+`docs/protocol.md` updated to match (new "Cambio 2026-09-01" entries,
+all 3 wire examples in the Trayectorias section updated).
+
+**PIVOT CONFIRMED STILL IN EFFECT**: Luis confirmed this session that
+`firmware/gaitsim-esp32-test/` is still NOT being tested against or
+flashed (the 2026-08-31 PIVOT above stands) — so `main.cpp` WAS updated
+to implement all 4 changes above (for protocol-completeness/
+consistency, and because it also fixed a real pre-existing gap:
+`handleTrajPoint()` never actually supported the untimed 3-field
+`TRAJ_POINT` form despite `docs/protocol.md` documenting it since
+2026-08-31), but treat those firmware edits as DORMANT — written to
+match the spec on paper, never reflashed or exercised this session.
+Do not treat this file as verified, and do not read its presence/
+correctness as evidence the protocol works on real hardware.
+
+Also folded into this session (found already on disk mid-session, not
+authored here, but pushed together and undocumented anywhere until
+now): `SystemStateMachine.MAX_SPEED_X_CM_S`/`_Y_CM_S`/`_ANGLE_DEG_S` +
+`TrajectorySpeedExceededError` — a hard per-axis speed ceiling enforced
+on every point of TIMED sends only (the CSV/gait ensayo), added after a
+REAL Y-axis overspeed incident on hardware (~90 cm/s at the default
+30x scale, ~2700 cm/s at 1x — see that exception's own docstring for
+the root cause: a stale `InitialPositionSession` offset landing in the
+ensayo's timed first point). `TrajectoryScreen` shows the resulting
+`(x, y, angle)` max speed after every Load&&Send/Reiniciar Ensayo
+attempt (red if any axis exceeded its limit, even though the send was
+already rejected in that case). Values are placeholders pending real
+rig calibration, same caveat as `STEPS_PER_CM_X`/etc.
+
+Git note: this session's local commit diverged from `origin/main` (2
+commits landed there from a 2026-08-31 session: a simpler firmware-only
+untimed-`TRAJ_POINT` fix, and the PIVOT documentation above). Merged
+via `git merge` (not rebase/force) — one real conflict in
+`firmware/gaitsim-esp32-test/main.cpp`'s `handleTrajPoint()` (both
+sides touched it), resolved by keeping this session's version since it
+was a strict superset (index + tipo, on top of the same untimed
+support). Pushed as merge commit `eeabb63`.
+
 ## Deferred / not built yet (do not build unless explicitly asked)
 GUI polish (splash screen, branding), user management, pathology
 library, automatic reports, Digital Twin, sensor integration beyond
