@@ -194,17 +194,48 @@ class ESP32Controller:
         self, axis: str, direction: str, steps: int, timeout: float = DEFAULT_TIMEOUT
     ) -> None:
         """
-        Move a single axis manually. Only valid when the system is idle
-        (not homing, not running) — the ESP32 itself enforces this and
-        will respond with an INVALID_STATE error otherwise.
+        Move a single axis manually, in raw motor steps, no bounds
+        checking beyond the firmware's own physical limit switches.
+
+        Reconciled 2026-09-02 against the real firmware: unlike the rest
+        of the protocol, MANUAL has NO state requirement at all on the
+        ESP32 side — it works before HOME too (see
+        SystemStateMachine.can_move_manually_raw()), since the firmware
+        doesn't need a calibrated origin to move a motor, only physical
+        limit switches as the safety backstop. It IS non-blocking on the
+        firmware: OK means the move was accepted and started, not that
+        it finished — use move_manual_stop() to interrupt it, or
+        GET_POSITION/all_axes_finished() indirectly (a further MANUAL
+        call on a still-moving axis gets BUSY, see below).
 
         Raises:
-            DeviceReportedError: If the move is rejected (e.g. wrong
-                state, limit reached).
+            DeviceReportedError: If the ESP32 responds BUSY (the
+                targeted axis hasn't finished a previous move yet) or
+                ERROR (e.g. limit already pressed toward that direction).
             TimeoutWaitingForResponseError: If no response arrives.
         """
         message = protocol.build_manual_move(axis, direction, steps)
-        self._send_and_wait(message, expected_kinds=["OK"], timeout=timeout)
+        response = self._send_and_wait(
+            message, expected_kinds=["OK", "BUSY"], timeout=timeout
+        )
+        if response.kind == "BUSY":
+            raise DeviceReportedError(
+                code="BUSY", message="El eje ya está en movimiento."
+            )
+
+    def move_manual_stop(self, timeout: float = DEFAULT_TIMEOUT) -> None:
+        """
+        Stop any manual move currently in progress, on any axis.
+        Idempotent — safe to call even if nothing is moving (still
+        responds STOPPED). See move_manual()'s docstring for why this
+        exists: MANUAL is non-blocking/asynchronous on the firmware.
+
+        Raises:
+            TimeoutWaitingForResponseError: If no response arrives.
+        """
+        self._send_and_wait(
+            protocol.build_manual_stop(), expected_kinds=["STOPPED"], timeout=timeout
+        )
 
     def get_position(self, timeout: float = DEFAULT_TIMEOUT) -> Position:
         """

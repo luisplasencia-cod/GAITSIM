@@ -44,7 +44,7 @@ estado actual):
 |---|---|
 | `DISCONNECTED` | Antes del primer `HOME` exitoso |
 | `HOMING` | Entre `<HOME>` y `READY` |
-| `IDLE` | Homed, listo para `MANUAL`/`TRAJ_BEGIN` |
+| `IDLE` | Homed, listo para `TRAJ_BEGIN` |
 | `RECEIVING_TRAJECTORY` | Entre `<TRAJ_BEGIN>` y `<TRAJ_END>` |
 | `RUNNING` | Entre `<RUN>` y `FINISHED`/`PAUSED`/`ABORTED` |
 | `PAUSED` | Entre `<PAUSE>` y `<RESUME>`/`<ABORT>` |
@@ -97,15 +97,47 @@ ESP32 van sin `<` `>`.
 
 | Comando | Formato | Respuesta |
 |---|---|---|
-| Manual | `<MANUAL:axis:direction:steps>` | `OK` o `ERROR:code:msg` |
+| Manual | `<MANUAL:axis_index:delta_steps>` | `OK`, `BUSY` o `ERROR:code:msg` |
+| Detener manual | `<MANUAL_STOP>` | `STOPPED` |
 
-`axis`: `X`/`Y`/`A`. `direction`: `1`=`+`, `0`=`-`. `steps`: entero
-positivo.
+`axis_index`: `0`=X, `1`=Y, `2`=Á (angular) — numérico, NO letra (todo
+parámetro después del nombre del comando se parsea con `atoi()` en el
+firmware). `delta_steps`: entero **con signo** — la dirección va
+incluida en el signo, no hay campo `direction` separado. `BUSY` llega
+si el eje pedido ya está en movimiento (una llamada `MANUAL` previa
+todavía no terminó); `MANUAL_STOP` no tiene parámetros y es idempotente
+(responde `STOPPED` aunque nada estuviera moviéndose).
 
-**¿Cuándo se usa?** Nunca, hoy — cuando el operador mueve el joystick
-en la pantalla de Inicio, la RPi NO manda `MANUAL`, manda una
-trayectoria de 1 solo eje (ver sección Trayectorias abajo). No lo
-implementes todavía; no rompe nada si tu firmware no lo reconoce.
+**Sin requisito de estado**: a diferencia de `TRAJ_BEGIN`/`RUN`,
+`MANUAL`/`MANUAL_STOP` NO requieren `HOME` previo — el firmware no
+necesita un origen calibrado para mover un motor, solo los finales de
+carrera físicos como protección (misma protección que existe después
+de calibrar). Por eso la RPi los usa también ANTES del primer `HOME`
+(ver "¿Cuándo se usa?" abajo).
+
+`MANUAL` es **no bloqueante** en el firmware: `OK` confirma que el
+movimiento fue aceptado y arrancó, no que ya terminó — el eje sigue
+moviéndose en segundo plano hasta completar los pasos pedidos o hasta
+`MANUAL_STOP`/un final de carrera.
+
+**¿Cuándo se usa?**
+- Antes del primer `HOME` (pantalla de Conexión, caja "Movimiento
+  Manual de Prueba"): la RPi manda `MANUAL` directo, en pasos crudos,
+  sin conversión a cm/grados ni validación de rango — solo sirve para
+  confirmar que cada eje responde y gira en el sentido esperado antes
+  de calibrar. Nuevo 2026-09-02 (antes no se usaba en absoluto).
+- Después de calibrar, el joystick de la pantalla de Trayectorias
+  sigue usando una trayectoria de 1 solo eje (ver sección Trayectorias
+  abajo), NO `MANUAL` — ese camino sí necesita el mapa de calibración
+  para validar rango, así que se mantiene sin cambios.
+
+**Cambio 2026-09-02 (formato real de MANUAL)**: `docs/protocol.md` y el
+código de la RPi asumían `<MANUAL:axis:direction:steps>` (eje como
+letra, dirección `1`/`0` separada, pasos sin signo) — ese formato
+nunca coincidió con el firmware definitivo real del compañero, que usa
+el formato de 2 parámetros de arriba. Corregido tras revisar
+`firmware/platformIO_control_trayectoria/src/main.cpp` (copia
+compartida por Luis, ya no la stale de sesiones previas).
 
 ## Consulta de Posición
 

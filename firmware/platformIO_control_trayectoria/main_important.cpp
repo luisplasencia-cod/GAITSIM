@@ -36,7 +36,6 @@ struct Axis {
 
 Axis axis_x, axis_y, axis_k;
 portMUX_TYPE axes_mux = portMUX_INITIALIZER_UNLOCKED; // A mux is used because of ESP32 has two cores
-portMUX_TYPE traj_state_mux = portMUX_INITIALIZER_UNLOCKED; // A mux is used because of ESP32 has two cores
 
 static inline void IRAM_ATTR axis_isr_common(Axis &ax){
   portENTER_CRITICAL_ISR(&axes_mux);
@@ -98,12 +97,13 @@ static inline void IRAM_ATTR axis_stop(Axis &ax){
 }
 
 void IRAM_ATTR isr_limit(){
-  limit_triggered = 1;
-  
   portENTER_CRITICAL_ISR(&axes_mux);
+
+  limit_triggered = 1;
   axis_stop(axis_x);
   axis_stop(axis_y);
   axis_stop(axis_k);
+
   portEXIT_CRITICAL_ISR(&axes_mux);
 }
 
@@ -299,7 +299,6 @@ void move_axes_relative(int dx, int dy, int dk, int vx, int vy, int vk){
   axis_move_steps(axis_k, dirk, sk, vk);
 }
 
-/*
 // Specific function
 void run_trajectory(int data_length, int *dt_ms, int *dx_steps, int *dy_steps, int *dk_steps){
   int sx, sy, sk, vx, vy, vk, dirx, diry, dirk;
@@ -350,124 +349,6 @@ void run_trajectory(int data_length, int *dt_ms, int *dx_steps, int *dy_steps, i
   Traj_state = TRAJ_FINISHED;
 
 }
-*/
-
-void run_timed_trajectory(int data_length, int *dt_ms, int *dx_steps, int *dy_steps, int *dk_steps){
-  int sx, sy, sk, vx, vy, vk, dirx, diry, dirk;
-
-  Traj_state = TRAJ_ACTIVE;
-
-  for(int i=0; i<data_length; i++){
-    if(limit_triggered || dt_ms[i] <= 0){
-      all_axes_stop();
-
-      portENTER_CRITICAL(&traj_state_mux);
-      Traj_state = TRAJ_FINISHED;
-      portEXIT_CRITICAL(&traj_state_mux);
-      return;
-    }
-
-    if (Traj_state == TRAJ_PAUSE_REQUESTED){
-      Traj_state = TRAJ_PAUSED;
-      while (Traj_state == TRAJ_PAUSED) {vTaskDelay(pdMS_TO_TICKS(10));}
-      if (Traj_state == TRAJ_ABORT_REQUESTED){
-        all_axes_stop();
-
-        portENTER_CRITICAL(&traj_state_mux);
-        Traj_state = TRAJ_FINISHED;
-        portEXIT_CRITICAL(&traj_state_mux);
-        return;
-      }
-      else if (Traj_state == TRAJ_RESUME_REQUESTED){
-        Traj_state = TRAJ_ACTIVE;
-      }
-    }
-
-    sx = abs(dx_steps[i]);
-    sy = abs(dy_steps[i]);
-    sk = abs(dk_steps[i]);
-
-    vx = sx*1000/dt_ms[i];
-    vy = sy*1000 /dt_ms[i];
-    vk = sk*1000/dt_ms[i];
-
-    dirx = (dx_steps[i] >= 0) ? axis_x.positive_dir : !axis_x.positive_dir;
-    diry = (dy_steps[i] >= 0) ? axis_y.positive_dir : !axis_y.positive_dir;
-    dirk = (dk_steps[i] >= 0) ? axis_k.positive_dir : !axis_k.positive_dir;
-
-    axis_move_steps(axis_x, dirx, sx, vx);
-    axis_move_steps(axis_y, diry, sy, vy);
-    axis_move_steps(axis_k, dirk, sk, vk);
-    
-    vTaskDelay(pdMS_TO_TICKS(dt_ms[i]));
-    while(!all_axes_finished()) {vTaskDelay(pdMS_TO_TICKS(1));}
-
-  }
-
-  portENTER_CRITICAL(&traj_state_mux);
-  Traj_state = TRAJ_FINISHED;
-  portEXIT_CRITICAL(&traj_state_mux);
-
-}
-
-void run_fixed_speed_trajectory(int data_length, int *dx_steps, int *dy_steps, int *dk_steps){
-  int sx, sy, sk, vx, vy, vk, dirx, diry, dirk;
-
-  Traj_state = TRAJ_ACTIVE;
-
-  for(int i=0; i<data_length; i++){
-    if(limit_triggered){
-      all_axes_stop();
-
-      portENTER_CRITICAL(&traj_state_mux);
-      Traj_state = TRAJ_FINISHED;
-      portEXIT_CRITICAL(&traj_state_mux);
-      return;
-    }
-
-    if (Traj_state == TRAJ_PAUSE_REQUESTED){
-      Traj_state = TRAJ_PAUSED;
-      while (Traj_state == TRAJ_PAUSED) {vTaskDelay(pdMS_TO_TICKS(10));}
-      if (Traj_state == TRAJ_ABORT_REQUESTED){
-        all_axes_stop();
-
-        portENTER_CRITICAL(&traj_state_mux);
-        Traj_state = TRAJ_FINISHED;
-        portEXIT_CRITICAL(&traj_state_mux);
-        return;
-      }
-      else if (Traj_state == TRAJ_RESUME_REQUESTED){
-        Traj_state = TRAJ_ACTIVE;
-      }
-    }
-
-    sx = abs(dx_steps[i]);
-    sy = abs(dy_steps[i]);
-    sk = abs(dk_steps[i]);
-
-    vx = HOMING_SPEED_X_STEPS_PER_SEC;
-    vy = HOMING_SPEED_Y_STEPS_PER_SEC;
-    vk = HOMING_SPEED_K_STEPS_PER_SEC;
-
-    dirx = (dx_steps[i] >= 0) ? axis_x.positive_dir : !axis_x.positive_dir;
-    diry = (dy_steps[i] >= 0) ? axis_y.positive_dir : !axis_y.positive_dir;
-    dirk = (dk_steps[i] >= 0) ? axis_k.positive_dir : !axis_k.positive_dir;
-
-    axis_move_steps(axis_x, dirx, sx, vx);
-    axis_move_steps(axis_y, diry, sy, vy);
-    axis_move_steps(axis_k, dirk, sk, vk);
-    
-    while(!all_axes_finished()) {vTaskDelay(pdMS_TO_TICKS(100));}
-
-  }
-
-  portENTER_CRITICAL(&traj_state_mux);
-  Traj_state = TRAJ_FINISHED;
-  portEXIT_CRITICAL(&traj_state_mux);
-
-}
-
-
 
 
 void handle_execute_calibration_command(Packet &rxPacket, Packet &txPacket){
@@ -554,34 +435,17 @@ void handle_send_position_command(Packet &rxPacket, Packet &txPacket){
 void handle_receive_trajectory_command(Packet &rxPacket, Packet &txPacket){
 
   if (strcmp(rxPacket.command, TRAJ_BEGIN) == 0){
-    if (rxPacket.parameters[0] == 1){
-      traj_receive_mode = 1;
-      gait_data_length = rxPacket.parameters[1];
-    }
-    else if (rxPacket.parameters[0] == 2){
-      traj_receive_mode = 2;
-      general_data_length = rxPacket.parameters[1];
-    }
-    else{
-      traj_receive_mode = 0;
-    }
+    gait_data_length = rxPacket.parameters[0];
 
     strncpy(txPacket.command, TRAJ_READY, MAX_COMMAND_LENGTH);
     txPacket.parameter_count = 0;
   }
 
   else if (strcmp(rxPacket.command, TRAJ_POINT) == 0){
-    if (traj_receive_mode == 1){
-      gait_dt_ms[rxPacket.parameters[0]] = rxPacket.parameters[1];
-      gait_dx_steps[rxPacket.parameters[0]] = rxPacket.parameters[2];
-      gait_dy_steps[rxPacket.parameters[0]] = rxPacket.parameters[3];
-      gait_dk_steps[rxPacket.parameters[0]] = rxPacket.parameters[4];
-    }
-    else{
-      general_dx_steps[rxPacket.parameters[0]] = rxPacket.parameters[1];
-      general_dy_steps[rxPacket.parameters[0]] = rxPacket.parameters[2];
-      general_dk_steps[rxPacket.parameters[0]] = rxPacket.parameters[3];
-    }
+    gait_dt_ms[rxPacket.parameters[0]] = rxPacket.parameters[1];
+    gait_dx_steps[rxPacket.parameters[0]] = rxPacket.parameters[2];
+    gait_dy_steps[rxPacket.parameters[0]] = rxPacket.parameters[3];
+    gait_dk_steps[rxPacket.parameters[0]] = rxPacket.parameters[4];
 
     strncpy(txPacket.command, ACK, MAX_COMMAND_LENGTH);
     txPacket.parameter_count = 1;
@@ -596,30 +460,22 @@ void handle_receive_trajectory_command(Packet &rxPacket, Packet &txPacket){
 }
 
 void handle_execute_trajectory_command(Packet &rxPacket, Packet &txPacket){
-  int any_limit_pressed = 0;
+  bool run_allowed;
 
   if (strcmp(rxPacket.command, RUN) == 0){
-    if (Traj_state != TRAJ_IDLE){
+    run_allowed = Traj_state == TRAJ_IDLE ||
+      Traj_state == TRAJ_FINISHED ||
+      Traj_state == TRAJ_FAILED;
+    
+    if (!run_allowed){
       strncpy(txPacket.command, ERROR, MAX_COMMAND_LENGTH);
       txPacket.parameter_count = 0;
     }
     else{
-      any_limit_pressed = button_pressed(LIMIT_X_MIN_PIN) || button_pressed(LIMIT_X_MAX_PIN) ||
-                          button_pressed(LIMIT_Y_MIN_PIN) || button_pressed(LIMIT_Y_MAX_PIN) ||
-                          button_pressed(LIMIT_K_MIN_PIN) || button_pressed(LIMIT_K_MAX_PIN);
-      
-      if (any_limit_pressed){
-        strncpy(txPacket.command, ERROR, MAX_COMMAND_LENGTH);
-        txPacket.parameter_count = 0;
-      }
-      else{
-        limit_triggered = 0;
-        traj_run_mode = rxPacket.parameters[0];
-        Traj_state = TRAJ_START_REQUESTED;
-        while (Traj_state == TRAJ_START_REQUESTED) {vTaskDelay(pdMS_TO_TICKS(5));}
-        strncpy(txPacket.command, RUNNING, MAX_COMMAND_LENGTH);
-        txPacket.parameter_count = 0;
-      }
+      Traj_state = TRAJ_START_REQUESTED;
+      while (Traj_state == TRAJ_START_REQUESTED) {vTaskDelay(pdMS_TO_TICKS(5));}
+      strncpy(txPacket.command, RUNNING, MAX_COMMAND_LENGTH);
+      txPacket.parameter_count = 0;
     }
   }
 
@@ -629,29 +485,18 @@ void handle_execute_trajectory_command(Packet &rxPacket, Packet &txPacket){
       txPacket.parameter_count = 0;
     }
     else{
-      portENTER_CRITICAL(&traj_state_mux);
-      if (Traj_state == TRAJ_ACTIVE) Traj_state = TRAJ_PAUSE_REQUESTED;
-      portEXIT_CRITICAL(&traj_state_mux);
-
-      while (Traj_state == TRAJ_PAUSE_REQUESTED) {vTaskDelay(pdMS_TO_TICKS(5));}
-
-      if (Traj_state == TRAJ_PAUSED) strncpy(txPacket.command, PAUSED, MAX_COMMAND_LENGTH);
-      else strncpy(txPacket.command, ERROR, MAX_COMMAND_LENGTH);
+      Traj_state = TRAJ_PAUSE_REQUESTED;
+      while (Traj_state == TRAJ_PAUSE_REQUESTED); {vTaskDelay(pdMS_TO_TICKS(5));}
+      strncpy(txPacket.command, PAUSED, MAX_COMMAND_LENGTH);
       txPacket.parameter_count = 0;
     }
   }
   
   else if (strcmp(rxPacket.command, RESUME) == 0){
-    if (Traj_state != TRAJ_PAUSED) {
-      strncpy(txPacket.command, ERROR, MAX_COMMAND_LENGTH);
-      txPacket.parameter_count = 0;
-    }
-    else{
-      Traj_state = TRAJ_RESUME_REQUESTED;
-      while (Traj_state == TRAJ_RESUME_REQUESTED) {vTaskDelay(pdMS_TO_TICKS(5));}
-      strncpy(txPacket.command, RUNNING, MAX_COMMAND_LENGTH);
-      txPacket.parameter_count = 0;
-    }
+    Traj_state = TRAJ_RESUME_REQUESTED;
+    while (Traj_state == TRAJ_RESUME_REQUESTED); {vTaskDelay(pdMS_TO_TICKS(5));}
+    strncpy(txPacket.command, RUNNING, MAX_COMMAND_LENGTH);
+    txPacket.parameter_count = 0;
   }
 
   else if (strcmp(rxPacket.command, ABORT) == 0){
@@ -661,7 +506,7 @@ void handle_execute_trajectory_command(Packet &rxPacket, Packet &txPacket){
     }
     else{
       Traj_state = TRAJ_ABORT_REQUESTED;
-      while (Traj_state == TRAJ_ABORT_REQUESTED) {vTaskDelay(pdMS_TO_TICKS(5));}
+      while (Traj_state == TRAJ_ABORT_REQUESTED); {vTaskDelay(pdMS_TO_TICKS(5));}
       strncpy(txPacket.command, ABORTED, MAX_COMMAND_LENGTH);
       txPacket.parameter_count = 0;
     }
@@ -673,23 +518,37 @@ void handle_execute_trajectory_command(Packet &rxPacket, Packet &txPacket){
       txPacket.parameter_count = 0;
     }
     else if (Traj_state == TRAJ_START_REQUESTED){
-      strncpy(txPacket.command, ACTIVE, MAX_COMMAND_LENGTH);
+      strncpy(txPacket.command, IDLE, MAX_COMMAND_LENGTH);
       txPacket.parameter_count = 0;
     }
     else if (Traj_state == TRAJ_ACTIVE){
-      strncpy(txPacket.command, ACTIVE, MAX_COMMAND_LENGTH);
+      strncpy(txPacket.command, RUNNING, MAX_COMMAND_LENGTH);
       txPacket.parameter_count = 0;
     }
     else if (Traj_state == TRAJ_PAUSE_REQUESTED){
-      strncpy(txPacket.command, ACTIVE, MAX_COMMAND_LENGTH);
+      strncpy(txPacket.command, RUNNING, MAX_COMMAND_LENGTH);
       txPacket.parameter_count = 0;
     }
     else if (Traj_state == TRAJ_PAUSED){
-      strncpy(txPacket.command, ACTIVE, MAX_COMMAND_LENGTH);
+      strncpy(txPacket.command, PAUSED, MAX_COMMAND_LENGTH);
       txPacket.parameter_count = 0;
     }
     else if (Traj_state == TRAJ_ABORT_REQUESTED){
-      strncpy(txPacket.command, ACTIVE, MAX_COMMAND_LENGTH);
+      strncpy(txPacket.command, PAUSED, MAX_COMMAND_LENGTH);
+      txPacket.parameter_count = 0;
+    }
+    else if (Traj_state == TRAJ_ABORTED){
+      strncpy(txPacket.command, ABORTED, MAX_COMMAND_LENGTH);
+      txPacket.parameter_count = 0;
+    }
+    else if (Traj_state == TRAJ_FAILED){
+      Traj_state = TRAJ_IDLE;
+      strncpy(txPacket.command, FAILED, MAX_COMMAND_LENGTH);
+      txPacket.parameter_count = 0;
+    }
+    else if (Traj_state == TRAJ_INTERRUPTED){
+      Traj_state = TRAJ_IDLE;
+      strncpy(txPacket.command, INTERRUPTED, MAX_COMMAND_LENGTH);
       txPacket.parameter_count = 0;
     }
     else if (Traj_state == TRAJ_FINISHED){
@@ -744,11 +603,11 @@ void command_dispatcher(Packet &rxPacket, Packet &txPacket){
   else if (strcmp(rxPacket.command, TRAJ_END) == 0){
     handle_receive_trajectory_command(rxPacket, txPacket);
   }
-  
+  /*
   else if (strcmp(rxPacket.command, RUN) == 0){
     handle_execute_trajectory_command(rxPacket, txPacket);
   }
-  
+  */
 
   else if (strcmp(rxPacket.command, PAUSE) == 0){
     handle_execute_trajectory_command(rxPacket, txPacket);
@@ -785,12 +644,7 @@ void primary_task(void *pvParameters){
 void auxiliar_task(void *pvParameters){
   while(1){
     if (Traj_state == TRAJ_START_REQUESTED){
-      if (traj_run_mode == 1){
-        run_timed_trajectory(gait_data_length, gait_dt_ms, gait_dx_steps, gait_dy_steps, gait_dk_steps);
-      }
-      else if (traj_run_mode == 2){
-        run_fixed_speed_trajectory(general_data_length, general_dx_steps, general_dy_steps, general_dk_steps);
-      }
+      run_trajectory(gait_data_length, gait_dt_ms, gait_dx_steps, gait_dy_steps, gait_dk_steps);
     }
     vTaskDelay(pdMS_TO_TICKS(100));
   }

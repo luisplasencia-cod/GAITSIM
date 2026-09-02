@@ -37,15 +37,21 @@ from typing import Optional
 CMD_PING = "PING"
 CMD_HOME = "HOME"
 
-CMD_MANUAL = "MANUAL"        # MANUAL:<axis>:<direction>:<steps>
+CMD_MANUAL = "MANUAL"             # MANUAL:<axis_index>:<delta_steps> (delta signed)
+CMD_MANUAL_STOP = "MANUAL_STOP"   # MANUAL_STOP (no parameters)
 
-# Wire encoding for the `direction` field of MANUAL: everything
-# past a command's first argument must be an integer (see docs/protocol.md,
-# Manual Movement Commands) — `axis` stays a letter (the allowed
-# first argument), so `direction` maps "+"/"-" to 1/0, matching the DIR
-# pin-level convention already used by the definitive ESP32 firmware
-# (X_POSITIVE_DIR = 1, etc.) for consistency between the two protocols.
-_DIRECTION_WIRE_CODE = {"+": 1, "-": 0}
+# Axis index encoding for MANUAL's first parameter, matching the
+# definitive ESP32 firmware's own axis order (0=X, 1=Y, 2=K/angular —
+# see handle_manual_relative_command() in the teammate's main.cpp).
+# EVERY parameter after a command's name is parsed with atoi() on the
+# wire (see the firmware's communication_rx()), so it must be numeric —
+# a letter axis would silently parse to 0. Reconciled 2026-09-02 after
+# Luis shared the teammate's actual firmware project
+# (firmware/platformIO_control_trayectoria) — docs/protocol.md and this
+# file previously assumed a 3-field axis-letter + direction(1/0) +
+# unsigned-steps form that the real firmware never implemented; the
+# direction is folded into the signed delta instead, no separate field.
+_MANUAL_AXIS_WIRE_CODE = {"X": 0, "Y": 1, "A": 2}
 
 CMD_TRAJ_BEGIN = "TRAJ_BEGIN"   # TRAJ_BEGIN:<tipo>:<n_points>
 CMD_TRAJ_POINT = "TRAJ_POINT"   # TRAJ_POINT:<index>:[<dt_ms>:]<x>:<y>:<angle>
@@ -83,6 +89,14 @@ CMD_GET_POSITION = "GET_POSITION"
 
 RESP_PONG = "PONG"
 RESP_OK = "OK"
+# MANUAL's own "not now" response (2026-09-02, reconciled against the
+# real firmware — see CMD_MANUAL above): returned instead of OK when
+# the targeted axis hasn't finished a previous move yet. Not an ERROR
+# (no code/message pair), so it gets its own ParsedResponse kind.
+RESP_BUSY = "BUSY"
+# MANUAL_STOP's response — idempotent on the firmware side (still
+# STOPPED even if nothing was moving).
+RESP_STOPPED = "STOPPED"
 RESP_TRAJ_READY = "TRAJ_READY"
 RESP_TRAJ_STORED = "TRAJ_STORED"
 RESP_RUNNING = "RUNNING"
@@ -259,12 +273,17 @@ def build_home() -> str:
 
 def build_manual_move(axis: str, direction: str, steps: int) -> str:
     """
-    Build a MANUAL movement command line.
+    Build a MANUAL movement command line: "<MANUAL:axis_index:delta>"
+    (2026-09-02 wire format, matching the real firmware — see CMD_MANUAL
+    above). `axis`/`direction`/`steps` is kept as this function's own
+    interface (unchanged) so callers (ESP32Controller.move_manual(),
+    SystemStateMachine.move_manual()) didn't need to change at all —
+    only the wire encoding built here did.
 
     Args:
         axis: One of "X", "Y", "A" (A = sagittal angle axis).
-        direction: "+" or "-" (sent on the wire as 1/0 respectively —
-                   see _DIRECTION_WIRE_CODE).
+        direction: "+" or "-" — folded into the signed delta sent on
+                   the wire (no separate direction field).
         steps: Number of steps to move. Must be a positive integer;
                direction is what determines the sign of the movement.
 
@@ -274,14 +293,25 @@ def build_manual_move(axis: str, direction: str, steps: int) -> str:
                     protocol boundary, prevents malformed commands from
                     ever reaching the serial link.
     """
-    valid_axes = ("X", "Y", "A")
-    if axis not in valid_axes:
-        raise ValueError(f"Invalid axis '{axis}'. Must be one of {valid_axes}.")
+    if axis not in _MANUAL_AXIS_WIRE_CODE:
+        raise ValueError(
+            f"Invalid axis '{axis}'. Must be one of {tuple(_MANUAL_AXIS_WIRE_CODE)}."
+        )
     if direction not in ("+", "-"):
         raise ValueError(f"Invalid direction '{direction}'. Must be '+' or '-'.")
     if steps <= 0:
         raise ValueError(f"Steps must be a positive integer, got {steps}.")
-    return f"<{CMD_MANUAL}:{axis}:{_DIRECTION_WIRE_CODE[direction]}:{steps}>"
+    delta = steps if direction == "+" else -steps
+    return f"<{CMD_MANUAL}:{_MANUAL_AXIS_WIRE_CODE[axis]}:{delta}>"
+
+
+def build_manual_stop() -> str:
+    """
+    Build a MANUAL_STOP command frame — stops any manual move currently
+    in progress on any axis. Idempotent on the ESP32 side: responds
+    STOPPED even if nothing was moving. No parameters.
+    """
+    return f"<{CMD_MANUAL_STOP}>"
 
 
 def build_trajectory_begin(n_points: int, timed: bool = True) -> str:
@@ -432,6 +462,10 @@ def parse_response(line: str) -> ParsedResponse:
         return ParsedResponse(kind="PONG", payload=None, raw=line)
     if text == RESP_OK:
         return ParsedResponse(kind="OK", payload=None, raw=line)
+    if text == RESP_BUSY:
+        return ParsedResponse(kind="BUSY", payload=None, raw=line)
+    if text == RESP_STOPPED:
+        return ParsedResponse(kind="STOPPED", payload=None, raw=line)
     if text == RESP_TRAJ_READY:
         return ParsedResponse(kind="TRAJ_READY", payload=None, raw=line)
     if text == RESP_TRAJ_STORED:

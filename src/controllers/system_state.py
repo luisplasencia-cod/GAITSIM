@@ -262,6 +262,35 @@ class SystemStateMachine:
         """True only when idle (not homing, not running, not receiving)."""
         return self._state == SystemState.IDLE
 
+    def can_move_manually_raw(self) -> bool:
+        """
+        True while connected but not yet calibrated (DISCONNECTED here
+        means "no successful HOME yet this session" — see can_home()'s
+        own docstring; the UI must additionally check
+        controller.is_connected, same pattern as can_home()).
+
+        Gates move_manual()/move_manual_stop() specifically — the RAW,
+        un-bounded step move (added 2026-09-02, "movimiento manual antes
+        de la calibración"), distinct from move_relative() (the
+        calibrated joystick, gated by can_move_manually() above, which
+        needs last_calibration_space and therefore can only run once
+        IDLE). Deliberately does NOT also return True once IDLE: after
+        HOME, the calibrated joystick is the intended manual control —
+        keeping this False there avoids two overlapping manual-move
+        paths coexisting in the same state. (Before 2026-09-02,
+        move_manual() was gated by can_move_manually() too, i.e.
+        IDLE-only, but no UI ever actually called it — this reassigns
+        it to the new pre-calibration use case instead of leaving it
+        dead code; see tests/manual_test_state_machine.py, updated the
+        same day.)
+
+        Safe pre-calibration because the real firmware's MANUAL command
+        has no HOME/state requirement of its own (see
+        ESP32Controller.move_manual()) — only the physical limit
+        switches back it up, same as after calibration.
+        """
+        return self._state == SystemState.DISCONNECTED
+
     def can_home(self) -> bool:
         """
         Homing is only allowed ONCE per session — right after
@@ -328,19 +357,42 @@ class SystemStateMachine:
 
     def move_manual(self, axis: str, direction: str, steps: int) -> None:
         """
-        Move a single axis manually. Only allowed while IDLE.
+        Move a single axis by a raw, un-bounded step count — only
+        allowed pre-calibration (see can_move_manually_raw()). Not to be
+        confused with move_relative() (the calibrated joystick, in real
+        units, gated by can_move_manually()/IDLE instead).
 
         Raises:
-            InvalidTransitionError: If not currently idle.
-            Any exception ESP32Controller.move_manual() may raise.
+            InvalidTransitionError: If can_move_manually_raw() is False.
+            Any exception ESP32Controller.move_manual() may raise (e.g.
+                DeviceReportedError if the targeted axis is still moving
+                from a previous call, or a limit switch is pressed).
         """
-        if not self.can_move_manually():
+        if not self.can_move_manually_raw():
             raise InvalidTransitionError(
-                f"Cannot move manually while in state {self._state.name}."
+                f"Cannot move manually (raw) while in state {self._state.name}."
             )
-        # Manual moves are quick and do not warrant their own transient
-        # state; the system remains IDLE before and after.
+        # Manual moves are quick (and non-blocking on the firmware — see
+        # ESP32Controller.move_manual()) and do not warrant their own
+        # transient state; the system remains in the same state before
+        # and after.
         self._controller.move_manual(axis, direction, steps)
+
+    def move_manual_stop(self) -> None:
+        """
+        Stop any in-progress raw manual move (see move_manual()) on any
+        axis. Same gate as move_manual() itself — this control only
+        exists for the pre-calibration raw movement path.
+
+        Raises:
+            InvalidTransitionError: If can_move_manually_raw() is False.
+            Any exception ESP32Controller.move_manual_stop() may raise.
+        """
+        if not self.can_move_manually_raw():
+            raise InvalidTransitionError(
+                f"Cannot stop manual movement while in state {self._state.name}."
+            )
+        self._controller.move_manual_stop()
 
     # Tolerance (degrees) for comparing an angle against
     # ANGLE_REFERENCE_DEG — floats, never compared with bare equality.

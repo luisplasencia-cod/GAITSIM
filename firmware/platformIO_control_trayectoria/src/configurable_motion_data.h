@@ -46,9 +46,9 @@ int general_dk_steps[MAX_DATA_LENGTH];
 
 // Search segment size while looking for a homing switch. Values are magnitudes
 // in motor steps; the calibration routine chooses the physical direction.
-#define HOMING_SEARCH_X_STEPS               800         // 2 cm
-#define HOMING_SEARCH_Y_STEPS               1600        // 2 cm
-#define HOMING_SEARCH_K_STEPS               300         // 2.7 deg
+#define HOMING_SEARCH_LIMIT_X_STEPS         28000       // 70 cm
+#define HOMING_SEARCH_LIMIT_Y_STEPS         72000       // 90 cm
+#define HOMING_SEARCH_LIMIT_K_STEPS         14000       // 126 deg
 
 // Distance used to move the axis away from a detected limit switch.
 // The same clearance is used to release MIN at startup and to release MAX
@@ -69,9 +69,14 @@ int general_dk_steps[MAX_DATA_LENGTH];
 #define HOMING_MAX_POSITION_K_STEPS         5400        // => 48.6 deg
 
 // Safe homing speeds. Units: motor steps per second.
-#define HOMING_SPEED_X_STEPS_PER_SEC        1200        // 3 rev/s => 30 mm/s
-#define HOMING_SPEED_Y_STEPS_PER_SEC        1200        // 3 rev/s => 15 mm/s
-#define HOMING_SPEED_K_STEPS_PER_SEC        2000        // 2.5 rev/s => 18 deg/s
+#define HOMING_SPEED_X_STEPS_PER_SEC        1600        // 4 rev/s => 40 mm/s
+#define HOMING_SPEED_Y_STEPS_PER_SEC        1600        // 4 rev/s => 20 mm/s
+#define HOMING_SPEED_K_STEPS_PER_SEC        3200        // 4 rev/s => 28.8 deg/s
+
+// Safe homing speeds. Units: motor steps per second. (OLD VALUES)
+//#define HOMING_SPEED_X_STEPS_PER_SEC        1200        // 3 rev/s => 30 mm/s
+//#define HOMING_SPEED_Y_STEPS_PER_SEC        1200        // 3 rev/s => 15 mm/s
+//#define HOMING_SPEED_K_STEPS_PER_SEC        2000        // 2.5 rev/s => 18 deg/s
 /*************************************************************************************************************************************************/
 
 

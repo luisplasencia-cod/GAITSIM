@@ -20,7 +20,7 @@ offer to save it — see src/controllers/initial_position_session.py.
 """
 
 from PySide6.QtCore import QEvent, Qt, Signal
-from PySide6.QtGui import QDoubleValidator, QFont, QFontMetrics
+from PySide6.QtGui import QDoubleValidator, QFont, QFontMetrics, QIntValidator
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QLineEdit, QGroupBox, QComboBox,
@@ -272,13 +272,54 @@ class ConnectionScreen(QWidget):
         self.goto_position_button.setStyleSheet(BUTTON_STYLE_COMPACT)
         position_layout.addWidget(self.goto_position_button, 2, 0, 1, 6)
 
-        # Manual movement used to have its own box here ("MOVIMIENTO
-        # MANUAL") — now the joystick control in TrajectoryScreen (see
-        # src/ui/manual_joystick.py), so position_box is the only thing
-        # left in this row.
+        # --- Manual test movement box (pre-calibration only) ---
+        # Added 2026-09-02, "movimiento manual antes de la calibración":
+        # different from the calibrated joystick in TrajectoryScreen
+        # (src/ui/manual_joystick.py, move_relative()) — this one sends
+        # RAW motor steps (SystemStateMachine.move_manual()), no
+        # cm conversion or range validation, since there is no
+        # CalibrationSpace yet before the first HOME. Only enabled while
+        # can_move_manually_raw() is True (see _refresh_controls) — once
+        # calibrated, the joystick on TrajectoryScreen takes over and
+        # this box disables itself.
+        manual_box = QGroupBox("MOVIMIENTO MANUAL DE PRUEBA (antes de calibrar)")
+        manual_layout = QGridLayout(manual_box)
+        manual_layout.setSpacing(LAYOUT_SPACING)
+
+        self.manual_steps_input = QLineEdit("500")
+        self.manual_steps_input.setStyleSheet(INPUT_STYLE)
+        self.manual_steps_input.setValidator(
+            QIntValidator(1, 100000, self.manual_steps_input)
+        )
+        self.manual_stop_button = QPushButton("Detener")
+        self.manual_stop_button.setStyleSheet(BUTTON_STYLE_COMPACT)
+
+        manual_layout.addWidget(QLabel("Pasos:"), 0, 0)
+        manual_layout.addWidget(self.manual_steps_input, 0, 1)
+        manual_layout.addWidget(self.manual_stop_button, 0, 2, 1, 2)
+
+        self.manual_buttons = {}  # (axis, direction) -> QPushButton
+
+        def make_manual_button(label: str, axis: str, direction: str, row: int, col: int):
+            btn = QPushButton(label)
+            btn.setStyleSheet(BUTTON_STYLE_COMPACT)
+            btn.clicked.connect(
+                lambda checked=False, a=axis, d=direction: self._on_manual_raw_clicked(a, d)
+            )
+            manual_layout.addWidget(btn, row, col)
+            self.manual_buttons[(axis, direction)] = btn
+
+        make_manual_button("X −", "X", "-", 1, 0)
+        make_manual_button("X +", "X", "+", 1, 1)
+        make_manual_button("Y −", "Y", "-", 2, 0)
+        make_manual_button("Y +", "Y", "+", 2, 1)
+        make_manual_button("Á −", "A", "-", 3, 0)
+        make_manual_button("Á +", "A", "+", 3, 1)
+
         bottom_row = QHBoxLayout()
         bottom_row.setSpacing(LAYOUT_SPACING)
-        bottom_row.addWidget(position_box)
+        bottom_row.addWidget(position_box, 2)
+        bottom_row.addWidget(manual_box, 1)
         root.addLayout(bottom_row)
 
         root.addStretch()
@@ -302,6 +343,7 @@ class ConnectionScreen(QWidget):
         self.refresh_positions_button.clicked.connect(self._refresh_position_list)
         self.load_position_button.clicked.connect(self._on_load_position_clicked)
         self.goto_position_button.clicked.connect(self._on_goto_position_clicked)
+        self.manual_stop_button.clicked.connect(self._on_manual_stop_clicked)
 
         self._bridge.state_changed.connect(self._on_state_changed)
         self._bridge.connected.connect(self._on_connected)
@@ -330,6 +372,37 @@ class ConnectionScreen(QWidget):
             self._bridge.state_machine.home,
             success_message="Calibración completada.",
             on_success=self._prompt_initial_position_setup,
+        )
+
+    def _on_manual_raw_clicked(self, axis: str, direction: str):
+        """
+        Raw pre-calibration test move (see manual_box in _build_ui) —
+        distinct from the calibrated joystick's move_relative(): no
+        cm conversion, no range validation, only the ESP32's own
+        physical limit switches as a backstop (see
+        SystemStateMachine.move_manual()/can_move_manually_raw()).
+        """
+        try:
+            steps = int(self.manual_steps_input.text())
+        except ValueError:
+            self.status_label.setText("Cantidad de pasos inválida.")
+            return
+        if steps <= 0:
+            self.status_label.setText("Cantidad de pasos inválida.")
+            return
+
+        def action_fn():
+            self._bridge.state_machine.move_manual(axis, direction, steps)
+
+        self._run_action(
+            action_fn,
+            success_message=f"Movimiento manual de prueba: {axis}{direction} {steps} pasos.",
+        )
+
+    def _on_manual_stop_clicked(self):
+        self._run_action(
+            self._bridge.state_machine.move_manual_stop,
+            success_message="Movimiento manual detenido.",
         )
 
     def _prompt_initial_position_setup(self):
@@ -641,6 +714,12 @@ class ConnectionScreen(QWidget):
 
         can_goto = controller.is_connected and sm.can_go_to_position()
         self.goto_position_button.setEnabled(can_goto)
+
+        can_manual_raw = controller.is_connected and sm.can_move_manually_raw()
+        for button in self.manual_buttons.values():
+            button.setEnabled(can_manual_raw)
+        self.manual_steps_input.setEnabled(can_manual_raw)
+        self.manual_stop_button.setEnabled(can_manual_raw)
 
     def showEvent(self, event):
         """

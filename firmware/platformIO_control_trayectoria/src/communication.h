@@ -4,6 +4,7 @@
 
 #include <Arduino.h>
 
+
 #define MAX_PARAMETERS          6
 #define BUFFER_SIZE             256
 #define BAUD_RATE               115200
@@ -18,6 +19,9 @@ typedef enum
   COMM_END_RECEPTION
 } CommunicationState;
 
+
+volatile int traj_receive_mode = 0;
+
 typedef enum
 {
   TRAJ_IDLE,
@@ -27,11 +31,10 @@ typedef enum
   TRAJ_PAUSED,
   TRAJ_RESUME_REQUESTED,
   TRAJ_ABORT_REQUESTED,
-  TRAJ_ABORTED,
   TRAJ_FINISHED,
-  TRAJ_INTERRUPTED,
-  TRAJ_FAILED
 } TrajectoryState;
+volatile int traj_run_mode = 0;
+
 
 volatile TrajectoryState Traj_state = TRAJ_IDLE;
 
@@ -83,8 +86,7 @@ volatile TrajectoryState Traj_state = TRAJ_IDLE;
 #define ABORTED           "ABORTED"
 #define TRAJ_STATUS       "TRAJ_STATUS"
 #define IDLE              "IDLE"
-#define FAILED            "FAILED"
-#define INTERRUPTED       "INTERRUPTED"
+#define ACTIVE            "ACTIVE"
 #define FINISHED          "FINISHED"
 
 // Generic error command
@@ -176,7 +178,7 @@ void communication_tx(Packet &packet){
     Serial.print(':');
     Serial.print(packet.parameters[i]);
   }
-
+  
   Serial.print('\n');
   //Serial.print('>');
 }

@@ -18,5 +18,12 @@ logs/
 # OS/editor cruft
 .DS_Store
 
+# Firmware zip uploads (e.g. CARPETAADRIAN.zip) — large, and the repo's
+# git history is already fragile from past large-blob corruption (see
+# CLAUDE.md "Known pre-existing issue"). Extract locally; only the
+# extracted source under firmware/ (its own .gitignore excludes .pio)
+# gets tracked.
+*.zip
+
 # Claude Code local machine settings (permissions allowlist, etc.)
 .claude/settings.local.json
