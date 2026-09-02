@@ -291,6 +291,11 @@ class ConnectionScreen(QWidget):
         self.manual_steps_input.setValidator(
             QIntValidator(1, 100000, self.manual_steps_input)
         )
+        # Same on-screen numeric keypad as the position fields above
+        # (see the comment there) — purely numeric field, same touchscreen
+        # keyboard reliability concern.
+        self.manual_steps_input.setAttribute(Qt.WA_InputMethodEnabled, False)
+        self.manual_steps_input.installEventFilter(self)
         self.manual_stop_button = QPushButton("Detener")
         self.manual_stop_button.setStyleSheet(BUTTON_STYLE_COMPACT)
 
@@ -326,14 +331,16 @@ class ConnectionScreen(QWidget):
 
     def eventFilter(self, watched, event):
         """
-        Shows the numeric keypad when one of the 3 initial-position
-        fields gains focus (see _build_ui, where they're registered via
+        Shows the numeric keypad when one of the numeric fields (the 3
+        initial-position fields plus the manual-steps field) gains focus
+        (see _build_ui, where they're registered via
         installEventFilter(self)) — a QLineEdit has no focus-in signal
         of its own in Qt, so an event filter is the standard way to
         observe it without subclassing the widget.
         """
         if event.type() == QEvent.FocusIn and watched in (
             self.pos_x_input, self.pos_y_input, self.pos_angle_input,
+            self.manual_steps_input,
         ):
             self._keypad.show_for(watched)
         return super().eventFilter(watched, event)

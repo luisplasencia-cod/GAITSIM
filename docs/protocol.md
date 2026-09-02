@@ -170,12 +170,30 @@ partir.
 | Punto (CON tiempo — solo ensayo/marcha) | `<TRAJ_POINT:index:dt_ms:dx_steps:dy_steps:dangle_steps>` | `ACK:index` |
 | Punto (SIN tiempo — todo lo demás) | `<TRAJ_POINT:index:dx_steps:dy_steps:dangle_steps>` | `ACK:index` |
 | Finalizar | `<TRAJ_END>` | `TRAJ_STORED` o `ERROR:code:msg` |
-| Correr | `<RUN:tipo>` | `RUNNING`, luego un `TRAJ_PROGRESS` por punto, luego `FINISHED` |
+| Correr | `<RUN:tipo>` | `RUNNING`/`ACTIVE`, luego un `TRAJ_PROGRESS` por punto, luego `FINISHED` |
 | Pausar | `<PAUSE>` | `PAUSED` |
-| Reanudar | `<RESUME>` | `RUNNING` |
+| Reanudar | `<RESUME>` | `RUNNING`/`ACTIVE` |
 | Abortar | `<ABORT>` (solo válido en `PAUSED`) | `ABORTED` o `ERROR:INVALID_STATE:...` |
 | Progreso (no solicitado) | `TRAJ_PROGRESS:t:x:y:angle` | — |
-| Estado (solicitado) | `<TRAJ_STATUS>` | `RUNNING`, `PAUSED`, `FINISHED` o `ERROR:INVALID_STATE:...` |
+| Estado (solicitado) | `<TRAJ_STATUS>` | `RUNNING`/`ACTIVE`, `PAUSED`, `FINISHED` o `ERROR:INVALID_STATE:...` |
+
+**Cambio 2026-09-02 (`ACTIVE` == `RUNNING`)**: el firmware real del
+compañero responde `ACTIVE` (no `RUNNING`) mientras una trayectoria
+sigue en ejecución — en `RUN`/`RESUME` y en las respuestas a
+`TRAJ_STATUS`. Confirmado por Luis como el vocabulario definitivo de
+ese firmware, así que la RPi trata ambas palabras como el MISMO estado
+(`parse_response()` en `protocol.py` mapea las dos al mismo `kind`) en
+vez de esperar que el firmware cambie. Motivo: sin este mapeo,
+`TRAJ_STATUS`/`PAUSE` no reconocían la respuesta y cada intento se
+quedaba colgado el timeout completo (3s) antes de fallar — visto en
+hardware real, ver la retro en `CLAUDE.md` (sesión 2026-09-02).
+
+También reconciliado ese mismo día: el firmware real todavía responde
+`ERROR` a secas (sin `:código:mensaje`) cuando rechaza un comando —
+p.ej. un `PAUSE` fuera de lugar. La RPi lo acepta como un `ERROR`
+genérico (código vacío) mientras el compañero no agregue códigos
+específicos; una vez que los agregue, ese `ERROR` a secas debería dejar
+de aparecer y este párrafo puede borrarse.
 
 **Cambio 2026-09-01 (`TRAJ_BEGIN`/`RUN` con tipo)**: ambos comandos
 ahora llevan un `tipo` — `1` = CON tiempo, `2` = SIN tiempo — así el

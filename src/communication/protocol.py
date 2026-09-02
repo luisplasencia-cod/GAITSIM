@@ -100,12 +100,25 @@ RESP_STOPPED = "STOPPED"
 RESP_TRAJ_READY = "TRAJ_READY"
 RESP_TRAJ_STORED = "TRAJ_STORED"
 RESP_RUNNING = "RUNNING"
+# The real firmware's own word for "still executing", used in its
+# TRAJ_STATUS reply — reconciled 2026-09-02 after a hardware incident
+# where the RPi never recognized it (parsed as UNKNOWN, silently
+# dropped, TRAJ_STATUS/PAUSE then spun for the full DEFAULT_TIMEOUT
+# every cycle — see the retro in CLAUDE.md). Semantically identical to
+# RUNNING, so parse_response() maps it to the SAME kind, not a new one.
+RESP_ACTIVE = "ACTIVE"
 RESP_FINISHED = "FINISHED"
 RESP_PAUSED = "PAUSED"
 RESP_ABORTED = "ABORTED"
 
 RESP_ACK_PREFIX = "ACK:"
 RESP_ERROR_PREFIX = "ERROR:"
+# The real firmware's rejection response has no ":<code>:<message>"
+# suffix yet (reconciled 2026-09-02, same incident as RESP_ACTIVE above
+# — the teammate plans to add specific codes later). Treated as kind
+# "ERROR" with an empty payload in the meantime, same as any other
+# ERROR — callers already handle an empty/unknown code gracefully
+# (DeviceReportedError with code="").
 RESP_TRAJ_PROGRESS_PREFIX = "TRAJ_PROGRESS:"
 RESP_POSITION_PREFIX = "POSITION:"
 
@@ -470,7 +483,7 @@ def parse_response(line: str) -> ParsedResponse:
         return ParsedResponse(kind="TRAJ_READY", payload=None, raw=line)
     if text == RESP_TRAJ_STORED:
         return ParsedResponse(kind="TRAJ_STORED", payload=None, raw=line)
-    if text == RESP_RUNNING:
+    if text == RESP_RUNNING or text == RESP_ACTIVE:
         return ParsedResponse(kind="RUNNING", payload=None, raw=line)
     if text == RESP_FINISHED:
         return ParsedResponse(kind="FINISHED", payload=None, raw=line)
@@ -482,6 +495,11 @@ def parse_response(line: str) -> ParsedResponse:
     if text.startswith(RESP_ACK_PREFIX):
         payload = text[len(RESP_ACK_PREFIX):]
         return ParsedResponse(kind="ACK", payload=payload, raw=line)
+
+    if text == RESP_ERROR_PREFIX.rstrip(":"):
+        # Bare "ERROR", no ":<code>:<message>" suffix yet — see the
+        # RESP_ERROR_PREFIX comment above.
+        return ParsedResponse(kind="ERROR", payload="", raw=line)
 
     if text.startswith(RESP_ERROR_PREFIX):
         # Keep the remainder ("<code>:<message>") intact as payload;
