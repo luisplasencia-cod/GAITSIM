@@ -592,6 +592,91 @@ sides touched it), resolved by keeping this session's version since it
 was a strict superset (index + tipo, on top of the same untimed
 support). Pushed as merge commit `eeabb63`.
 
+**Implemented (2026-09-08), RPi-side only, code-only — NOT yet
+verified on real hardware**: "Reiniciar Ensayo" (`trajectory_screen.py`)
+can now repeat the same ensayo N times instead of just once, per Luis's
+request. Design confirmed with Luis before implementing (per this
+file's Confirmation protocol): reuses the SAME button rather than
+adding a new one.
+- `_on_restart_trial_clicked` now first asks the count via
+  `QInputDialog.getInt` (the "floating window" Luis asked for; 1 = same
+  behavior as before, unchanged, no dialog-driven regression for the
+  common case).
+- The actual reposition→resend→run sequence (previously the whole body
+  of `_on_restart_trial_clicked`) was extracted into `_restart_trial()`,
+  called once directly and then automatically re-called from
+  `_on_trajectory_finished` for each remaining leg — chaining happens
+  ONLY on a real `FINISHED` (an abort, e.g. via Pause -> "Elegir Otro
+  Ensayo", never fires that signal, so pausing already halts the chain
+  with no extra state check needed). `info_label` shows `(current/N)`
+  progress during the sequence.
+- New `_repeats_remaining`/`_repeats_total` on `TrajectoryScreen`, reset
+  by new `_cancel_repeat_sequence()` on anything that should stop the
+  chain: a failed leg (new `on_failure` param threaded through
+  `_run_action`), a device error, a disconnect, or "Elegir Otro Ensayo".
+- Per Luis's explicit choice: the existing "¿guardar posición inicial?"
+  offer (`_maybe_offer_save_position`) now fires only once, after the
+  WHOLE sequence completes (or is cancelled) — not after every leg.
+- Verified only via `py_compile` + manual trace of the chaining logic —
+  same Confirmation protocol as every other feature in this file: do
+  not treat this as done until tested on real Raspberry Pi + real
+  ESP32 and explicitly confirmed.
+
+**Fixed (2026-09-08, separate session): real bug making device errors
+feel like "the app closes and I have to recalibrate."** Root cause was
+in `bridge.py`, not in any error-handling logic: `StateMachineBridge.
+__init__` was directly reassigning `state_machine.controller.on_error`/
+`on_disconnected` to its own Qt-signal-emitting handlers. Since those
+are single-callback attributes (not a list) and `SystemStateMachine.
+__init__` had ALREADY claimed them for itself one line earlier (to run
+its own recovery — fall back to IDLE on an error, mark DISCONNECTED +
+require re-HOME on a real disconnect), the bridge's assignment silently
+replaced that handler instead of adding to it. Net effect: on ANY
+unsolicited ESP32 error, `SystemStateMachine._state` stayed stuck at
+whatever it was (e.g. RUNNING) forever — every `can_home()/
+can_move_manually()/can_run()/etc.` then stayed locked against that
+stale state, so nothing in the app worked afterward. Luis's only way
+out was to close and relaunch, which re-initializes `_homed = False`
+and throws away the real HOME calibration for no actual reason (the
+ESP32 itself was still fine — never actually disconnected).
+- Fix: `SystemStateMachine` now exposes its own `on_device_error`/
+  `on_disconnected` callback attributes (same pattern already used
+  correctly for `on_trajectory_finished`), fired at the END of its own
+  `_on_device_error`/`_on_disconnected` — i.e. AFTER its internal
+  recovery already ran, not instead of it. `bridge.py` now subscribes
+  to THOSE two attributes rather than ever touching
+  `controller.on_error`/`on_disconnected` directly.
+- Confirmed via a mocked-controller offscreen script (no real ESP32):
+  an unsolicited error now correctly falls `SystemStateMachine.state`
+  back to IDLE, leaves `_homed` untouched (`can_home()` stays False,
+  no forced re-HOME), and the operator can keep operating (manual
+  move, resend, run again) right away — while a REAL disconnect still
+  correctly moves to DISCONNECTED and requires re-HOME (unavoidable:
+  the ESP32 itself lost its reference in that case). Bridge's Qt
+  signals (`device_error`/`disconnected`) still fire exactly as
+  before in both cases — only the internal state recovery was broken,
+  not the UI notification.
+- Added `src/ui/device_error_dialog.py` (`DeviceErrorDialog` +
+  `show_device_error()`): a non-modal, reused-per-screen dialog shown
+  from `connection_screen.py`'s and `trajectory_screen.py`'s existing
+  `_on_device_error` handlers (in addition to, not instead of, the
+  status-label text they already set) — the raw `code`/`message` plus
+  a short plain-language explanation and suggested next step per known
+  code (`LIMIT_REACHED`, `INVALID_STATE`, `TYPE_MISMATCH`,
+  `POINT_INDEX_MISMATCH`, `POINT_COUNT_MISMATCH`, `UNKNOWN_COMMAND`,
+  bare `ERROR`), plus an explicit "no es necesario recalibrar" line —
+  accurate for every code currently in `docs/protocol.md`, since none
+  of them represent a lost HOME reference (only a real disconnect does,
+  which surfaces through the separate "Disconnected" text instead, not
+  this dialog). Non-modal on purpose: Luis may be at the physical rig,
+  not looking at the screen, when this fires, and dismissing it must
+  never block retrying the action right away.
+- Verified offscreen only (dialog construction/text via `QT_QPA_
+  PLATFORM=offscreen`, plus the mocked-controller script above) — NOT
+  yet seen on real hardware. Next real device error on the actual rig
+  is the real test: confirm the app stays usable afterward with no
+  restart/recalibration needed.
+
 ## Deferred / not built yet (do not build unless explicitly asked)
 GUI polish (splash screen, branding), user management, pathology
 library, automatic reports, Digital Twin, sensor integration beyond

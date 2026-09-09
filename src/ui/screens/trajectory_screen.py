@@ -32,13 +32,14 @@ from src.communication.protocol import TrajectoryPoint
 from src.controllers.initial_position_session import InitialPositionSession
 from src.ui.action_worker import ActionWorker as _ActionWorker
 from src.ui.bridge import StateMachineBridge
+from src.ui.device_error_dialog import show_device_error
 from src.ui.limit_violation_dialog import LimitViolationDialog
 from src.ui.manual_joystick import ManualJoystickControl
 from src.ui.platform_view import PlatformView, PositionPoller
 from src.ui.theme_manager import ThemeManager
 from src.ui.style import (
     BUTTON_STYLE_SLIM, BUTTON_STYLE_PRIMARY_SLIM,
-    LAYOUT_SPACING, LAYOUT_MARGIN, FONT_SIZE_NORMAL,
+    LAYOUT_SPACING, LAYOUT_MARGIN, FONT_SIZE_NORMAL, FONT_SIZE_LARGE,
     COLOR_AXIS_X, COLOR_AXIS_Y, COLOR_AXIS_ANGLE,
     COLOR_BG, COLOR_TEXT, COLOR_TEXT_MUTED, COLOR_DANGER,
 )
@@ -107,6 +108,22 @@ class TrajectoryScreen(QWidget):
         # reuses the SAME position (never calls position_session.set())
         # and re-sends _ensayo_trajectory itself via _send_and_check().
         self._ensayo_sent_for_position = None
+
+        # Repeat-sequence state for "Reiniciar Ensayo" (added 2026-09-08):
+        # _repeats_remaining counts chained restarts still owed AFTER the
+        # one currently in flight; _repeats_total is the count entered in
+        # the dialog, kept only to render "(current/total)" progress and
+        # to know whether a "sequence complete" message is warranted (>1)
+        # vs. plain single-restart behavior (1, or 0 when no sequence is
+        # active at all — e.g. a normal Run). Both reset to 0 by
+        # _cancel_repeat_sequence() on anything that should stop the
+        # chain: a validation failure, a failed reposition/send/run, an
+        # error, a disconnect, or "Elegir Otro Ensayo". See
+        # _on_trajectory_finished for where the chaining actually happens
+        # (only a REAL FINISHED continues it — an abort never fires that
+        # signal, so pausing already halts the chain with no extra code).
+        self._repeats_remaining = 0
+        self._repeats_total = 0
 
         # Live-plot data buffers, filled incrementally by
         # trajectory_progress signals — but ONLY while _plot_active is
@@ -206,9 +223,24 @@ class TrajectoryScreen(QWidget):
         # posición inicial, retorno seguro) never go through this.
         scale_row = QHBoxLayout()
         scale_label = QLabel("Escala de tiempo (x):")
-        scale_label.setStyleSheet(f"font-size: {FONT_SIZE_NORMAL}px;")
+        scale_label.setStyleSheet(f"font-size: {FONT_SIZE_LARGE}px;")
         self.time_scale_spinbox = QDoubleSpinBox()
-        self.time_scale_spinbox.setStyleSheet(slim_combo_style)
+        # NOT slim_combo_style: that rule's selector is "QComboBox", so it
+        # never actually matched this QDoubleSpinBox — this control was
+        # rendering at Qt's tiny default size the whole time. Own style,
+        # deliberately bigger than the rest of this slim sidebar (a wrong
+        # value here silently mis-scales the whole ensayo — see the
+        # MAX_SPEED_* discussion above — so it earns the extra touch size).
+        self.time_scale_spinbox.setStyleSheet(f"""
+            QDoubleSpinBox {{
+                min-height: 48px;
+                font-size: {FONT_SIZE_LARGE}px;
+                padding: 2px 4px;
+            }}
+            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
+                width: 32px;
+            }}
+        """)
         # No fixed upper cap (per Luis's explicit choice) — only a
         # positive-value floor above 0, since a zero/negative scale
         # would collapse or invert the trajectory's timeline.
@@ -242,7 +274,12 @@ class TrajectoryScreen(QWidget):
         )
         select_layout.addWidget(self.speed_label)
 
-        sidebar.addWidget(select_box)
+        # stretch=0 normally (plot box below claims the leftover space);
+        # while the live plot is hidden (_LIVE_PLOT_VISIBLE, see
+        # _build_plot_box) there's nothing left to claim it, so this box
+        # gets a share instead — per Luis's request, that freed vertical
+        # space should go to the sidebar's buttons, not sit blank.
+        sidebar.addWidget(select_box, stretch=0 if self._LIVE_PLOT_VISIBLE else 1)
 
         # --- Execution --- (no title text — see _NO_TITLE_GROUPBOX_STYLE)
         exec_box = QGroupBox("")
@@ -282,7 +319,7 @@ class TrajectoryScreen(QWidget):
         retry_layout.addWidget(self.choose_other_button)
         exec_box_layout.addLayout(retry_layout)
 
-        sidebar.addWidget(exec_box)
+        sidebar.addWidget(exec_box, stretch=0 if self._LIVE_PLOT_VISIBLE else 1)
 
         # Plot box takes whatever's left in the sidebar column (stretch=1,
         # see _build_plot_box) — select_box/exec_box above are now
@@ -399,6 +436,15 @@ class TrajectoryScreen(QWidget):
     )
     _PLOT_TITLE_SIZE = "9pt"
 
+    # Hidden per Luis's request (2026-09-08): pos_x/pos_y live feedback
+    # isn't implemented yet on the real firmware, so the plot has nothing
+    # real to show. All the plotting machinery below is left fully built
+    # (still fed by _on_trajectory_progress) so this is a one-line
+    # re-enable once that's ready — just flip this back to True. The
+    # freed sidebar space goes to select_box/exec_box instead (see their
+    # stretch factors in _build_ui) rather than sitting blank.
+    _LIVE_PLOT_VISIBLE = False
+
     # Overrides ONLY the title-reserved space (margin-top/padding-top)
     # that the app-wide QGroupBox rule (style.py's APP_STYLESHEET)
     # always reserves for a title, whether one is set or not — used on
@@ -430,6 +476,7 @@ class TrajectoryScreen(QWidget):
         # height in this box goes to the graph now.
         plot_box = QGroupBox("")
         plot_box.setStyleSheet(self._NO_TITLE_GROUPBOX_STYLE)
+        plot_box.setVisible(self._LIVE_PLOT_VISIBLE)
         plot_layout = QVBoxLayout(plot_box)
 
         self._plot_widget = pg.GraphicsLayoutWidget()
@@ -748,12 +795,39 @@ class TrajectoryScreen(QWidget):
 
     def _on_restart_trial_clicked(self):
         """
+        Asks how many times to run the SAME trial (1 = today's plain
+        single restart, unchanged; N>1 = auto-chain N restarts, one per
+        FINISHED — see _on_trajectory_finished) before doing the first
+        one. QInputDialog.getInt is the "floating window" Luis asked
+        for — same pattern already used elsewhere in this screen (e.g.
+        _offer_save_as_new_position) rather than a bespoke QDialog.
+        """
+        count, ok = QInputDialog.getInt(
+            self, "Repetir Ensayo",
+            "¿Cuántas veces ejecutar este ensayo? (1 = una sola vez)",
+            1, 1, 999,
+        )
+        if not ok:
+            return
+        self._repeats_total = count
+        self._repeats_remaining = count - 1
+        self._restart_trial()
+
+    def _restart_trial(self):
+        """
         Restarts the SAME trial: reposition to the SAME initial point
         used last, then resend the SAME loaded trajectory and run it —
         no manual "Load && Send"/"Run" presses needed. Resending (rather
         than relying on the ESP32 still having it stored from before)
         keeps this independent of how long TRAJ_STORED persists across
         an ABORT on whatever firmware is running.
+
+        Called both directly (single restart / first leg of a repeat
+        sequence, from _on_restart_trial_clicked) and automatically by
+        _on_trajectory_finished to run the next leg of a repeat
+        sequence — _repeats_total/_repeats_remaining (set by the
+        caller before this runs) only drive the progress text here;
+        this method itself just performs one leg.
         """
         sm = self._bridge.state_machine
         was_paused = sm.can_abort()
@@ -761,11 +835,14 @@ class TrajectoryScreen(QWidget):
         target = self._position_session.position
         if target is None:
             self.info_label.setText("No hay una posición inicial previa registrada.")
+            self._cancel_repeat_sequence()
             return
         if self._ensayo_trajectory is None:
             self.info_label.setText("No hay una trayectoria cargada para reiniciar.")
+            self._cancel_repeat_sequence()
             return
         if not self._check_ensayo_within_range("Ensayo rechazado"):
+            self._cancel_repeat_sequence()
             return
         floor_y = target.y
 
@@ -785,13 +862,32 @@ class TrajectoryScreen(QWidget):
             self._begin_plot_session()
             sm.run()
 
+        current_rep = self._repeats_total - self._repeats_remaining
+        progress = (
+            f" ({current_rep}/{self._repeats_total})"
+            if self._repeats_total > 1 else ""
+        )
         self._clear_plot()
-        self.info_label.setText("Regresando a la posición inicial...")
+        self.info_label.setText(f"Regresando a la posición inicial...{progress}")
         self._run_action(
             do_restart,
-            success_message="Ensayo reiniciado. Running...",
+            success_message=f"Ensayo reiniciado. Running...{progress}",
             min_duration_ms=3000,
+            on_failure=self._cancel_repeat_sequence,
         )
+
+    def _cancel_repeat_sequence(self):
+        """
+        Stops a "Reiniciar Ensayo" repeat sequence from chaining any
+        further — called on anything that means the operator (or a
+        failure) is no longer expecting it to continue: a failed leg,
+        a device error, a disconnect, or "Elegir Otro Ensayo". A plain
+        single restart (count=1) is a no-op case of this same state
+        (_repeats_total already 0 by the time FINISHED arrives), so
+        nothing else needs to special-case "was this ever a sequence".
+        """
+        self._repeats_remaining = 0
+        self._repeats_total = 0
 
     def _on_choose_other_clicked(self):
         """
@@ -810,6 +906,10 @@ class TrajectoryScreen(QWidget):
         # for the NEXT trial, which must never write into this
         # (now-abandoned) ensayo's plot.
         self._end_plot_session()
+        # Also the one place a mid-sequence "Reiniciar Ensayo" repeat
+        # count gets abandoned: choosing a different trial entirely
+        # means whatever repeats were still pending no longer apply.
+        self._cancel_repeat_sequence()
         sm = self._bridge.state_machine
         if sm.can_abort():
             self._run_action(
@@ -822,7 +922,7 @@ class TrajectoryScreen(QWidget):
 
     def _run_action(
         self, action_fn, success_message: str = "OK", on_success=None,
-        min_duration_ms: int = 0,
+        min_duration_ms: int = 0, on_failure=None,
     ):
         """
         min_duration_ms: keeps whatever the info_label already shows
@@ -832,6 +932,12 @@ class TrajectoryScreen(QWidget):
         GOTO) can flip the label before the operator has time to read
         it. Only pads the display, never delays a slow real action
         beyond however long it actually takes.
+
+        on_failure: extra cleanup beyond the generic failed-message
+        display (_on_action_failed) — currently only used by
+        "Reiniciar Ensayo" to cancel a pending repeat sequence when a
+        leg fails partway through, since no FINISHED will ever arrive
+        for that leg to chain the next one from.
         """
         self._worker = _ActionWorker(action_fn)
         start_time = time.monotonic()
@@ -850,8 +956,13 @@ class TrajectoryScreen(QWidget):
             else:
                 apply_success()
 
+        def handle_failure(message):
+            self._on_action_failed(message)
+            if on_failure is not None:
+                on_failure()
+
         self._worker.succeeded.connect(handle_success)
-        self._worker.failed.connect(self._on_action_failed)
+        self._worker.failed.connect(handle_failure)
         self._worker.start()
 
     def _on_action_succeeded(self, message: str):
@@ -916,7 +1027,28 @@ class TrajectoryScreen(QWidget):
         # manual move back on ConnectionScreen) can never be mistaken
         # for this ensayo's own execution if this screen is revisited.
         self._end_plot_session()
-        self.info_label.setText("Trajectory FINISHED.")
+
+        # "Reiniciar Ensayo" repeat sequence: a REAL FINISHED is the
+        # only thing that chains to the next leg — an abort (Pause ->
+        # Elegir Otro Ensayo) never fires this signal at all, so simply
+        # pausing already halts the chain with no extra guard needed
+        # (see _cancel_repeat_sequence, called there anyway for
+        # explicitness/robustness). _repeats_remaining is 0 for both a
+        # plain single restart and a normal Run, so this only ever
+        # takes the branch below during an actual N>1 sequence.
+        if self._repeats_remaining > 0:
+            self._repeats_remaining -= 1
+            self._refresh_controls()
+            self._restart_trial()
+            return
+
+        if self._repeats_total > 1:
+            self.info_label.setText(
+                f"Secuencia completa ({self._repeats_total}/{self._repeats_total})."
+            )
+        else:
+            self.info_label.setText("Trajectory FINISHED.")
+        self._repeats_total = 0
         self._refresh_controls()
         self._maybe_offer_save_position()
 
@@ -1046,12 +1178,17 @@ class TrajectoryScreen(QWidget):
         # An error during RUNNING falls back to IDLE without ever
         # reporting FINISHED (see SystemStateMachine._on_device_error) —
         # end the session so a later, unrelated movement isn't mistaken
-        # for a continuation of this (now-aborted) ensayo.
+        # for a continuation of this (now-aborted) ensayo. Also cancels
+        # any pending "Reiniciar Ensayo" repeat count for the same
+        # reason: no FINISHED will arrive to chain the next leg from.
         self._end_plot_session()
+        self._cancel_repeat_sequence()
         self.info_label.setText(f"ERROR [{code}]: {message}")
+        show_device_error(self, "_device_error_dialog", self, code, message)
 
     def _on_disconnected(self):
         self._end_plot_session()
+        self._cancel_repeat_sequence()
         self.info_label.setText("Disconnected.")
         self._refresh_controls()
 

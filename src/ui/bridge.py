@@ -52,12 +52,22 @@ class StateMachineBridge(QObject):
         self._state_machine.on_trajectory_finished = self._on_trajectory_finished
         self._state_machine.on_trajectory_progress = self._on_trajectory_progress
 
-        # Also forward the underlying ESP32Controller's error/disconnect
-        # events, since SystemStateMachine consumes them internally but
+        # Also forward the state machine's own error/disconnect
+        # notifications (fired AFTER it already reacted internally —
+        # see SystemStateMachine.on_device_error/on_disconnected), since
         # the UI still needs to know an error occurred (e.g. to show a
         # message), not just that the state fell back to IDLE.
-        self._state_machine.controller.on_error = self._on_device_error
-        self._state_machine.controller.on_disconnected = self._on_disconnected
+        #
+        # IMPORTANT: subscribe to these two state-machine-level
+        # attributes, NOT `self._state_machine.controller.on_error`/
+        # `on_disconnected` directly — SystemStateMachine already claims
+        # that single-callback slot for itself in its own __init__ to
+        # run its internal recovery (fall back to IDLE / mark
+        # DISCONNECTED). Reassigning it here would silently replace that
+        # handler instead of adding to it, leaving `_state` stuck
+        # wherever it was when the error/disconnect happened.
+        self._state_machine.on_device_error = self._on_device_error
+        self._state_machine.on_disconnected = self._on_disconnected
 
     @property
     def state_machine(self) -> SystemStateMachine:

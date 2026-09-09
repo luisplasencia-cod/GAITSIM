@@ -32,10 +32,11 @@ from src.ui.style import (
 from src.ui.theme_manager import ThemeManager
 from src.utils.trajectory_validator import PositionOutOfRangeError, check_position
 
-# Same 3 presets ConnectionScreen's old increment buttons offered — this
-# is now the only place that selects one, cycled via the center button
-# instead of 3 separate radio-style buttons.
-STEP_VALUES = (1.0, 5.0, 10.0)
+# Same 3 presets ConnectionScreen's old increment buttons offered, plus a
+# 0.1cm (1mm) fine-adjustment step added 2026-09-09 (Luis's request) —
+# this is the only place that selects one, cycled via the center button
+# instead of separate radio-style buttons.
+STEP_VALUES = (0.1, 1.0, 5.0, 10.0)
 
 # Up=Y+, Down=Y-, Left=X-, Right=X+ — standard joystick convention
 # (right/up = positive). Clockwise=A+, counter-clockwise=A- (arbitrary
@@ -131,7 +132,7 @@ class ManualJoystickControl(QWidget):
         self._position_session = position_session
         self._on_status = on_status
         self._worker = None
-        self._step_index = 0  # cycles STEP_VALUES: 1 -> 5 -> 10 -> 1
+        self._step_index = 0  # cycles STEP_VALUES: 0.1 -> 1 -> 5 -> 10 -> 0.1
         self._buttons = {}  # direction key -> QPushButton
         # True once the operator has dragged the control at least once —
         # from then on its position is THEIRS, so parent resizes must
@@ -192,8 +193,8 @@ class ManualJoystickControl(QWidget):
         )
         # Styled by _apply_theme() — see make_button()'s comment above.
         self._center_button.setToolTip(
-            "Toca para cambiar el paso (1 / 5 / 10) — mantén presionado y "
-            "arrastra para mover este control"
+            "Toca para cambiar el paso (0.1 / 1 / 5 / 10) — mantén presionado "
+            "y arrastra para mover este control"
         )
         self._center_button.clicked.connect(self._cycle_step)
         layout.addWidget(self._center_button, 1, 1)

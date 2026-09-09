@@ -221,6 +221,23 @@ class SystemStateMachine:
         self.on_state_changed: Optional[Callable[[SystemState], None]] = None
         self.on_trajectory_finished: Optional[Callable[[], None]] = None
         self.on_trajectory_progress: Optional[Callable[[TrajectoryPoint], None]] = None
+        # Fired at the END of _on_device_error()/_on_disconnected() below
+        # (after this class's own state recovery already ran) — lets the
+        # UI (via StateMachineBridge) know an error/disconnect happened
+        # WITHOUT bypassing that recovery. See this class's own
+        # `_controller.on_error`/`on_disconnected` subscription just
+        # below: StateMachineBridge must subscribe to THESE two
+        # attributes, never reassign `controller.on_error`/
+        # `on_disconnected` directly — that single-callback slot is
+        # already claimed by this class, and overwriting it silently
+        # disables the state recovery entirely (2026-09-08 bug: an
+        # unsolicited device error left `_state` stuck wherever it was,
+        # e.g. RUNNING, instead of falling back to IDLE — every
+        # can_home()/can_move_manually()/etc. then stayed locked, making
+        # the app effectively unusable until restarted, which lost the
+        # HOME calibration for no real reason).
+        self.on_device_error: Optional[Callable[[str, str], None]] = None
+        self.on_disconnected: Optional[Callable[[], None]] = None
 
         # Result of the most recently completed HOME's limit-mapping
         # sweep (see CalibrationSpace) — None until the first HOME
@@ -980,13 +997,18 @@ class SystemStateMachine:
     # STEPS_PER_CM_X/Y above, pending real rig calibration: derived
     # from this real ensayo's own normal (non-defective) per-point
     # speed profile, re-scaled from the 30x default time scale down to
-    # 13x (a deliberately conservative floor above the 1x scale that
-    # tripped a real motor stall, still comfortably above 25x/30x,
-    # which tested fine) — NOT a measured motor/driver spec. Revisit
-    # once real max-speed numbers are known.
-    MAX_SPEED_X_CM_S = 15.0
-    MAX_SPEED_Y_CM_S = 3.0
-    MAX_SPEED_ANGLE_DEG_S = 35.0
+    # a conservative floor above the 1x scale that tripped a real motor
+    # stall — NOT a measured motor/driver spec. Revisit once real
+    # max-speed numbers are known.
+    # That floor moved from 13x to 10x on 2026-09-08 (Luis's explicit
+    # choice) — i.e. these 3 values are the previous ones (15.0/3.0/35.0
+    # at the 13x floor) scaled up by 13/10 = 1.3, so the SAME normal
+    # per-point profile that used to require at least a 13x time-scale
+    # to stay under this ceiling now only needs 10x (a faster/less-
+    # stretched ensayo playback).
+    MAX_SPEED_X_CM_S = 19.5
+    MAX_SPEED_Y_CM_S = 3.9
+    MAX_SPEED_ANGLE_DEG_S = 45.5
 
     def _build_calibration_space(self, limits: HomeLimits) -> CalibrationSpace:
         """Converts a HOME's raw-step HomeLimits (from
@@ -1017,13 +1039,24 @@ class SystemStateMachine:
         IDLE rather than guessing a more specific recovery state. This
         may be refined later (e.g. a dedicated FAULT state) once real
         failure modes are better understood from the definitive firmware.
+
+        Deliberately does NOT touch `_homed` — none of the error codes
+        currently in docs/protocol.md represent a lost HOME reference
+        (only an actual dropped connection does, see _on_disconnected
+        below), so can_home() correctly stays False and the operator can
+        resume operating from IDLE (manual move, resend, run again)
+        without recalibrating.
         """
         self._set_state(SystemState.IDLE)
+        if self.on_device_error is not None:
+            self.on_device_error(code, message)
 
     def _on_disconnected(self) -> None:
         """Called when the serial connection is unexpectedly lost."""
         self._homed = False  # a fresh connect requires a fresh HOME
         self._set_state(SystemState.DISCONNECTED)
+        if self.on_disconnected is not None:
+            self.on_disconnected()
 
     # ------------------------------------------------------------------
     # Internal: state transition with notification

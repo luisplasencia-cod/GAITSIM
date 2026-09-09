@@ -31,6 +31,7 @@ from src.communication.protocol import Position
 from src.controllers.initial_position_session import InitialPositionSession
 from src.ui.action_worker import ActionWorker
 from src.ui.bridge import StateMachineBridge
+from src.ui.device_error_dialog import show_device_error
 from src.ui.numeric_keypad import NumericKeypad
 from src.ui.theme_manager import ThemeManager
 from src.ui.style import (
@@ -675,6 +676,7 @@ class ConnectionScreen(QWidget):
 
     def _on_device_error(self, code: str, message: str):
         self.status_label.setText(f"Error del ESP32 [{code}]: {message}")
+        show_device_error(self, "_device_error_dialog", self, code, message)
         # An error during the synchronized initial move (e.g. a limit
         # reached mid-trajectory) falls back to IDLE without ever
         # reporting FINISHED (see SystemStateMachine._on_device_error) —
