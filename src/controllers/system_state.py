@@ -20,6 +20,7 @@ from enum import Enum, auto
 from typing import Callable, List, Optional
 
 from src.communication.esp32_controller import (
+    DeviceReportedError,
     ESP32Controller,
     TrajectoryTransferResult,
 )
@@ -758,21 +759,53 @@ class SystemStateMachine:
         self._set_state(SystemState.RUNNING)
 
     def pause(self) -> None:
-        """Pause an in-progress run. Transitions RUNNING -> PAUSED."""
+        """
+        Pause an in-progress run. Transitions RUNNING -> PAUSED.
+
+        Fixed 2026-09-10: if the ESP32 rejects PAUSE with ERROR (e.g. it
+        silently reset/rebooted mid-run — see logs/gaitsim.log incident
+        this session, position jumping straight to 0:0:0 with no
+        FINISHED/ABORTED), `_state` used to stay stuck at RUNNING
+        forever: can_pause() kept returning True (so retrying just
+        failed the same way) while can_abort() stayed False (requires
+        PAUSED) — a total UI lockout needing an app/ESP32 restart,
+        because this failure path never went through _on_device_error()
+        (that recovery is only wired to the controller's *unsolicited*
+        ERROR callback — see that method's docstring — and an ERROR
+        arriving as PAUSE's own response is consumed as PAUSE's expected
+        reply, never reaching that path). Now explicitly routes a
+        rejected PAUSE through the same IDLE-fallback recovery before
+        re-raising, so the caller's existing failure-message UI still
+        shows the raw error too.
+        """
         if not self.can_pause():
             raise InvalidTransitionError(
                 f"Cannot pause while in state {self._state.name}."
             )
-        self._controller.pause()
+        try:
+            self._controller.pause()
+        except DeviceReportedError as exc:
+            self._on_device_error(exc.code, exc.message)
+            raise
         self._set_state(SystemState.PAUSED)
 
     def resume(self) -> None:
-        """Resume a paused run. Transitions PAUSED -> RUNNING."""
+        """
+        Resume a paused run. Transitions PAUSED -> RUNNING.
+
+        Same rejected-command recovery as pause() (see its docstring,
+        2026-09-10 fix) — a rejected RESUME falls back to IDLE instead
+        of leaving `_state` stuck at PAUSED with no way out.
+        """
         if not self.can_resume():
             raise InvalidTransitionError(
                 f"Cannot resume while in state {self._state.name}."
             )
-        self._controller.resume()
+        try:
+            self._controller.resume()
+        except DeviceReportedError as exc:
+            self._on_device_error(exc.code, exc.message)
+            raise
         self._set_state(SystemState.RUNNING)
 
     def abort(self) -> None:
@@ -794,6 +827,14 @@ class SystemStateMachine:
             )
         try:
             self._controller.abort()
+        except DeviceReportedError as exc:
+            # Same rejected-command recovery as pause()/resume() (see
+            # pause()'s docstring, 2026-09-10 fix) — without this, a
+            # rejected ABORT left `_state` stuck at PAUSED with every
+            # action gated on RUNNING/IDLE/PAUSED locked out.
+            _logger.debug("abort() FAILED: ESP32 rejected it: %r", exc)
+            self._on_device_error(exc.code, exc.message)
+            raise
         except Exception as exc:
             _logger.debug("abort() FAILED: ESP32 rejected it: %r", exc)
             raise
