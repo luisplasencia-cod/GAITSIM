@@ -17,7 +17,7 @@ run through the existing TRAJ_BEGIN/TRAJ_POINT/TRAJ_END + RUN protocol
 came from. No new wire protocol or firmware changes are needed for
 this.
 
-Two entry points:
+Three entry points:
     - generate_synchronized_trajectory(target, calibration_space,
       start=...): a single synchronized straight-line move, used as-is
       for the post-calibration (0, 0, 0) -> initial-position move.
@@ -29,6 +29,12 @@ Two entry points:
       reference angle — see that function's docstring and
       SystemStateMachine.safe_return_to_position(), which is the only
       caller.
+    - generate_detach_trajectory(...): 2 such moves stitched together,
+      used right before Run when a tara (basal, no-contact reference)
+      is on record for the loaded ensayo, so a force-platform contact
+      test doesn't start the run already in contact — see that
+      function's docstring and SystemStateMachine.perform_pre_run_detach(),
+      which is the only caller.
 """
 
 from typing import List
@@ -247,5 +253,78 @@ def generate_safe_return_trajectory(
     # reasoning as generate_synchronized_trajectory's final snap.
     points[-1] = TrajectoryPoint(
         t=points[-1].t, x=target.x, y=target.y, angle=target.angle
+    )
+    return points
+
+
+def generate_detach_trajectory(
+    current: Position,
+    tara_y: float,
+    lift_above_tara_cm: float,
+    x_shift_cm: float,
+    calibration_space: CalibrationSpace,
+) -> List[TrajectoryPoint]:
+    """
+    "Platform detach" trajectory run right before Run whenever a tara
+    (basal, no-contact reference) has been recorded for the loaded
+    ensayo — see SystemStateMachine.perform_pre_run_detach(), the only
+    sanctioned caller, and the contact-threshold testing workflow it
+    supports: an operator manually lowers Y in small increments from
+    the tara reference to find the force platform's contact threshold,
+    then presses Run at that (already touching) Y. Running straight
+    from there would start the gait trajectory — and its force trace —
+    with contact already established. This trajectory instead lifts
+    clear of the platform, shifts sideways to fully detach, then swings
+    back down into the EXACT same (x, y, angle) `current` position the
+    operator was at, so the platform arrives back in contact already IN
+    MOTION rather than starting cold — the actual gait run (sent/run
+    separately, immediately after this) then begins smoothly from
+    there.
+
+    Two synchronized (multi-axis-at-once) legs, mirroring the "en el
+    mismo tiempo" requirement Luis specified for the return leg:
+
+        1. Lift + shift back: `current` -> (current.x - x_shift_cm,
+           min(tara_y + lift_above_tara_cm, calibration_space.y_max),
+           current.angle). Y and X move together, angle unchanged —
+           unlike generate_safe_return_trajectory, this never touches
+           angle, so there is no ANGLE_REFERENCE_DEG-style constraint
+           forcing X and Y apart here.
+        2. Shift forward + descend: -> `current`. Symmetric return.
+
+    `lift_above_tara_cm`/`x_shift_cm` are Luis's fixed constants (see
+    SystemStateMachine.DETACH_LIFT_ABOVE_TARA_CM/DETACH_X_SHIFT_CM).
+    The lift target is capped at `calibration_space.y_max` (graceful
+    cap, same pattern as generate_safe_return_trajectory's lift_y) and
+    the shift target at `calibration_space.x_min` (always 0.0, X never
+    goes negative) — defensive backstops only; in normal operation
+    (per Luis) real trials stay well clear of X=0, so this cap is not
+    expected to actually bind.
+
+    `current` is NOT validated against `calibration_space` (same
+    reasoning as generate_safe_return_trajectory: it is the system's
+    real, already-reached position) — the intermediate detach point is
+    implicitly kept in range by the clamping above, not by a separate
+    validate_position() call.
+
+    Returns:
+        A single continuous List[TrajectoryPoint] spanning both legs, t
+        starting at 0, ending exactly back at `current`. Empty list
+        only in the degenerate case where both legs are simultaneously
+        no-ops.
+    """
+    lift_y = min(tara_y + lift_above_tara_cm, calibration_space.y_max)
+    shifted_x = max(current.x - x_shift_cm, calibration_space.x_min)
+    detached = Position(shifted_x, lift_y, current.angle)
+
+    points: List[TrajectoryPoint] = []
+    offset = 0.0
+    offset = _append_phase(points, _interpolate(current, detached), offset)
+    offset = _append_phase(points, _interpolate(detached, current), offset)
+
+    if not points:
+        return []
+    points[-1] = TrajectoryPoint(
+        t=points[-1].t, x=current.x, y=current.y, angle=current.angle
     )
     return points

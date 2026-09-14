@@ -977,6 +977,91 @@ class SystemStateMachine:
             self.on_trajectory_finished = original_on_finished
 
     # ------------------------------------------------------------------
+    # Pre-run platform detach (contact-threshold ("tara") testing)
+    # ------------------------------------------------------------------
+
+    # Vertical clearance (cm) above the recorded tara Y the platform
+    # rises to before shifting sideways — see perform_pre_run_detach().
+    # Fixed for now (2026-09-14, Luis's explicit choice) rather than a
+    # UI-configurable value: this is the more safety-critical of the
+    # two detach margins, so it stays a named constant, same spirit as
+    # Y_LIFT_MARGIN_CM above.
+    DETACH_LIFT_ABOVE_TARA_CM = 1.0
+
+    # Horizontal shift (cm, toward X=0) used to fully clear the force
+    # platform's contact zone while lifted, before swinging back into
+    # position. Also fixed for now, same reasoning as
+    # DETACH_LIFT_ABOVE_TARA_CM.
+    DETACH_X_SHIFT_CM = 1.0
+
+    def perform_pre_run_detach(self, tara: Position) -> None:
+        """
+        Lift the platform clear of the force plate, shift sideways to
+        fully detach, then swing back down into the EXACT position the
+        system was already at before this call — see
+        trajectory_generator.generate_detach_trajectory() for the
+        2-leg movement itself and why it exists (contact-threshold
+        testing: an operator lowers Y from a recorded `tara` reference
+        in small increments to find the force platform's contact
+        point, then presses Run at that already-touching Y; this call
+        is what TrajectoryScreen runs FIRST in that case, so the actual
+        gait trajectory that follows starts already in motion rather
+        than starting cold with contact already established).
+
+        `tara` is the basal (no-contact) reference recorded for the
+        loaded ensayo (see tara_library.py) — only its `y` is used
+        (the lift height is computed relative to THAT, not the
+        system's current Y), `x`/`angle` are not read here.
+
+        Like safe_return_to_position(), this call BLOCKS until the
+        detach move physically completes (see _run_trajectory_blocking)
+        and does NOT fire the public on_trajectory_finished callback —
+        it is not a gait trajectory the operator ran, just an
+        implementation detail of getting back into position before one.
+        The caller (TrajectoryScreen) is responsible for re-sending the
+        actual ensayo afterward: this internal move's own TRAJ_BEGIN
+        overwrites whatever the ESP32 had stored from an earlier
+        Load && Send.
+
+        Only allowed while IDLE (see can_go_to_position()) — call after
+        a CSV has been sent/validated, before run(), same point in the
+        flow safe_return_to_position() already occupies for "Reiniciar
+        Ensayo".
+
+        Raises:
+            InvalidTransitionError: If not currently idle.
+            RuntimeError: If no CalibrationSpace is available (e.g. an
+                older firmware whose HOME didn't report a full 3-axis
+                limit-mapping sweep).
+            Any exception send_trajectory()/run() may raise.
+        """
+        if not self.can_go_to_position():
+            raise InvalidTransitionError(
+                f"Cannot perform pre-run detach while in state {self._state.name}."
+            )
+        if self.last_calibration_space is None:
+            raise RuntimeError(
+                "No hay datos de calibración disponibles; no se puede "
+                "calcular la secuencia de despegue."
+            )
+
+        # Deferred import: same circular-import reasoning as
+        # safe_return_to_position() above.
+        from src.utils import trajectory_generator
+
+        current = self.get_position()
+        points = trajectory_generator.generate_detach_trajectory(
+            current,
+            tara.y,
+            self.DETACH_LIFT_ABOVE_TARA_CM,
+            self.DETACH_X_SHIFT_CM,
+            self.last_calibration_space,
+        )
+        if not points:
+            return
+        self._run_trajectory_blocking(points)
+
+    # ------------------------------------------------------------------
     # Internal: reactions to asynchronous ESP32Controller events
     # ------------------------------------------------------------------
 

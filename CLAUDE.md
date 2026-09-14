@@ -677,6 +677,81 @@ ESP32 itself was still fine — never actually disconnected).
   is the real test: confirm the app stays usable afterward with no
   restart/recalibration needed.
 
+**Implemented (2026-09-14): contact-threshold ("tara") testing
+workflow — design confirmed with Luis before implementing (per this
+file's Confirmation protocol), code-only, NOT yet verified on real
+hardware.** Purpose: Luis manually lowers Y in small increments from a
+recorded "no contact" basal reference (the "tara") to find the force
+platform's contact threshold for a given ensayo, then presses Run at
+that already-touching Y — running straight from there would start the
+gait trajectory (and its force trace) with contact already established.
+- New `src/controllers/tara_library.py` (mirrors `position_library.py`'s
+  convention): one JSON file per trajectory id under `data/tara/`,
+  `{"tara": {x,y,angle,timestamp}, "pruebas": [{y,timestamp}, ...]}`.
+  `save_tara()` always overwrites unconditionally (the "corrección
+  futura" flow Luis asked for) but preserves existing `pruebas`;
+  `add_prueba()` appends one contact-test record.
+- `trajectory_generator.generate_detach_trajectory(current, tara_y,
+  lift_above_tara_cm, x_shift_cm, calibration_space)`: 2 synchronized
+  legs (lift `tara_y + 1cm` + shift `-1cm` in X together, then shift
+  back + descend together — "en el mismo tiempo" per Luis's spec),
+  starting and ending at the EXACT same `current` position, so the
+  platform re-arrives at the contact point already in motion instead
+  of the run starting cold. Same generation style as
+  `generate_safe_return_trajectory` (graceful Y/X capping against
+  `CalibrationSpace`, `current` itself not re-validated). Sent/run
+  through the SAME existing untimed `TRAJ_BEGIN/TRAJ_POINT/TRAJ_END+RUN`
+  protocol — no wire/firmware changes.
+- `SystemStateMachine.perform_pre_run_detach(tara)` (new
+  `DETACH_LIFT_ABOVE_TARA_CM`/`DETACH_X_SHIFT_CM` constants, both fixed
+  at `1.0`cm per Luis's explicit choice, not UI-configurable) — thin
+  wrapper generating + running the detach trajectory via the existing
+  `_run_trajectory_blocking()`, same IDLE-only gate and
+  `on_trajectory_finished` suppression as `safe_return_to_position()`.
+- `trajectory_screen.py`: new "TARA (REFERENCIA BASAL)" box (Tara
+  button + status label) next to Load && Send — records
+  `position_session.position` (kept in sync by manual jog, see
+  `InitialPositionSession.apply_manual_delta`) as the tara for the
+  loaded CSV, confirming before overwriting an existing one. `Run` and
+  `Reiniciar Ensayo` (every leg of a repeat sequence, not just the
+  first — Luis's explicit confirmation) now check for a tara on the
+  loaded ensayo: if present, `perform_pre_run_detach()` runs FIRST,
+  the landed-back-at Y is logged via `add_prueba()`, then the ensayo is
+  RE-SENT (the detach's own `TRAJ_BEGIN` overwrites whatever Load &&
+  Send had stored) before `run()`. No tara on record -> unchanged
+  behavior (opt-in per CSV, confirmed with Luis).
+- New `src/ui/screens/tara_history_screen.py` (`TaraHistoryScreen`),
+  reachable via a new "Pruebas" nav bar entry (`main_window.py`, 3rd
+  `QStackedWidget` page) — read-only table, one row per prueba across
+  every ensayo, refreshed on show. "Exportar a Excel (.xlsx)" button
+  (on-demand, per Luis's choice over `.csv`) via `pandas.DataFrame.
+  to_excel(engine="openpyxl")` — added `openpyxl` to `requirements.txt`
+  (pandas was already a dependency). Purely file-based
+  (`tara_library.py` directly), no bridge dependency.
+- `docs/protocol.md`: unchanged — no new wire command, same reasoning
+  as `safe_return_to_position()`/the synchronized initial-position
+  trajectory before it.
+- Verified OFFSCREEN only, same "mocked controller, not just unit
+  logic" depth as prior sessions' entries: `generate_detach_trajectory`
+  geometry (starts/ends exactly at `current`, reaches the expected
+  lifted/shifted waypoint, Y/X capping against `CalibrationSpace`);
+  `tara_library` round-trip (save/load/add_prueba/overwrite-preserves-
+  pruebas/load_all); `perform_pre_run_detach()` against a mocked
+  `ESP32Controller` (async-`FINISHED` simulated via a background
+  timer, matching real hardware's callback ordering) — confirms exactly
+  one trajectory sent, `run()` called untimed, state back to IDLE, and
+  `InvalidTransitionError` when not IDLE; `pandas`+`openpyxl` xlsx
+  export/read round-trip against the table's exact row/column shape.
+  The Qt widgets themselves (Tara button, history screen/table) were
+  NOT rendered even offscreen this session (PySide6 unavailable in
+  this dev environment) — reviewed by code inspection + `py_compile`
+  only. NOT tested on real hardware. Same Confirmation protocol as
+  every other feature in this file: do not treat this as done until
+  verified on real Raspberry Pi + real ESP32 (in particular: the
+  detach sequence's physical direction — Y-up/X-toward-zero — and that
+  the ensayo genuinely resumes smoothly after the re-send) and
+  explicitly confirmed.
+
 ## Deferred / not built yet (do not build unless explicitly asked)
 GUI polish (splash screen, branding), user management, pathology
 library, automatic reports, Digital Twin, sensor integration beyond

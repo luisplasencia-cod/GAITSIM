@@ -20,6 +20,7 @@ from src.controllers.initial_position_session import InitialPositionSession
 from src.controllers.system_state import SystemStateMachine
 from src.ui.bridge import StateMachineBridge
 from src.ui.screens.connection_screen import ConnectionScreen
+from src.ui.screens.tara_history_screen import TaraHistoryScreen
 from src.ui.screens.trajectory_screen import TrajectoryScreen
 from src.ui.screens.welcome_screen import WelcomeScreen
 from src.ui.calibration_map_window import CalibrationMapWindow
@@ -81,9 +82,15 @@ class MainWindow(QMainWindow):
         self._connection_screen.request_show_monitor.connect(self._show_monitor_screen)
         self._calibration_map_window = None  # created lazily, see _open_calibration_map
 
+        # Read-only "hoja de cálculo" view over every tara/prueba
+        # recorded via TrajectoryScreen's Tara button — purely
+        # file-based (tara_library.py), no bridge dependency needed.
+        self._tara_history_screen = TaraHistoryScreen(theme_manager)
+
         self._stack = QStackedWidget()
-        self._stack.addWidget(self._connection_screen)   # index 0
-        self._stack.addWidget(self._trajectory_screen)    # index 1
+        self._stack.addWidget(self._connection_screen)     # index 0
+        self._stack.addWidget(self._trajectory_screen)      # index 1
+        self._stack.addWidget(self._tara_history_screen)    # index 2
 
         nav_bar = self._build_nav_bar()
 
@@ -217,11 +224,18 @@ class MainWindow(QMainWindow):
         self._trajectory_nav_btn.setStyleSheet(NAV_BUTTON_STYLE())
         self._trajectory_nav_btn.clicked.connect(lambda: self._stack.setCurrentIndex(1))
 
+        self._tara_history_nav_btn = QPushButton("Pruebas")
+        self._tara_history_nav_btn.setCheckable(True)
+        self._tara_history_nav_btn.setStyleSheet(NAV_BUTTON_STYLE())
+        self._tara_history_nav_btn.clicked.connect(lambda: self._stack.setCurrentIndex(2))
+
         self._nav_group.addButton(self._connection_nav_btn)
         self._nav_group.addButton(self._trajectory_nav_btn)
+        self._nav_group.addButton(self._tara_history_nav_btn)
 
         layout.addWidget(self._connection_nav_btn)
         layout.addWidget(self._trajectory_nav_btn)
+        layout.addWidget(self._tara_history_nav_btn)
         layout.addStretch()
 
         self._calibration_map_btn = QPushButton("Espacio Disponible")
@@ -278,7 +292,7 @@ class MainWindow(QMainWindow):
         """
         for button in (
             self._connection_nav_btn, self._trajectory_nav_btn,
-            self._calibration_map_btn,
+            self._tara_history_nav_btn, self._calibration_map_btn,
         ):
             button.setStyleSheet(NAV_BUTTON_STYLE())
         self._exit_button.setStyleSheet(EXIT_BUTTON_STYLE())

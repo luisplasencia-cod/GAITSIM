@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.communication.protocol import TrajectoryPoint
+from src.controllers import tara_library
 from src.controllers.initial_position_session import InitialPositionSession
 from src.ui.action_worker import ActionWorker as _ActionWorker
 from src.ui.bridge import StateMachineBridge
@@ -95,6 +96,13 @@ class TrajectoryScreen(QWidget):
         # _on_send_clicked, and only replaced by loading a different
         # CSV, never mutated in place by any other flow.
         self._ensayo_trajectory = None
+        # The trajectory_combo id `_ensayo_trajectory` was loaded from —
+        # None until a load succeeds, set alongside it in
+        # _on_send_clicked. Used only to key tara_library records (the
+        # basal/no-contact reference recorded per-CSV via the Tara
+        # button, see _on_tara_clicked/_refresh_tara_label) to the
+        # right ensayo.
+        self._ensayo_trajectory_id = None
         # The initial position `_ensayo_trajectory` was last successfully
         # sent for (see _send_and_check) — None until a send succeeds.
         # Run is only enabled when this matches the CURRENT
@@ -280,6 +288,24 @@ class TrajectoryScreen(QWidget):
         # gets a share instead — per Luis's request, that freed vertical
         # space should go to the sidebar's buttons, not sit blank.
         sidebar.addWidget(select_box, stretch=0 if self._LIVE_PLOT_VISIBLE else 1)
+
+        # --- Tara (referencia basal, pruebas de contacto) ---
+        # See _on_tara_clicked/perform_pre_run_detach: records the
+        # current (y, angle) as the "no contact" reference for the
+        # loaded ensayo, so Run can automatically detach-and-reapproach
+        # before executing it whenever the operator has since lowered Y
+        # to a contact-test height. One tara per CSV (tara_library.py),
+        # updatable (the button re-prompts before overwriting).
+        tara_box = QGroupBox("TARA (REFERENCIA BASAL)")
+        tara_layout = QVBoxLayout(tara_box)
+        self.tara_label = QLabel("Carga un ensayo para ver/registrar su tara.")
+        self.tara_label.setWordWrap(True)
+        self.tara_label.setStyleSheet(f"font-size: {FONT_SIZE_NORMAL}px;")
+        tara_layout.addWidget(self.tara_label)
+        self.tara_button = QPushButton("Tara (guardar posición actual)")
+        self.tara_button.setStyleSheet(BUTTON_STYLE_SLIM)
+        tara_layout.addWidget(self.tara_button)
+        sidebar.addWidget(tara_box, stretch=0)
 
         # --- Execution --- (no title text — see _NO_TITLE_GROUPBOX_STYLE)
         exec_box = QGroupBox("")
@@ -576,6 +602,7 @@ class TrajectoryScreen(QWidget):
         self.resume_button.clicked.connect(self._on_resume_clicked)
         self.restart_trial_button.clicked.connect(self._on_restart_trial_clicked)
         self.choose_other_button.clicked.connect(self._on_choose_other_clicked)
+        self.tara_button.clicked.connect(self._on_tara_clicked)
 
         self._bridge.state_changed.connect(self._on_state_changed)
         self._bridge.trajectory_finished.connect(self._on_trajectory_finished)
@@ -612,6 +639,7 @@ class TrajectoryScreen(QWidget):
         except Exception as exc:
             self.info_label.setText(f"Failed to load '{trajectory_id}': {exc}")
             self._ensayo_trajectory = None
+            self._ensayo_trajectory_id = None
             return
 
         # Stretch the whole recorded timeline by the chosen factor
@@ -628,6 +656,8 @@ class TrajectoryScreen(QWidget):
             TrajectoryPoint(t=p.t * time_scale, x=p.x, y=p.y, angle=p.angle)
             for p in loaded
         ]
+        self._ensayo_trajectory_id = trajectory_id
+        self._refresh_tara_label()
         # Whatever position the PREVIOUS trajectory (if any) was sent
         # for is no longer relevant — Run stays blocked until THIS one
         # is actually sent (see _send_and_check / _refresh_controls).
@@ -772,10 +802,119 @@ class TrajectoryScreen(QWidget):
             for p in points
         ]
 
+    # ------------------------------------------------------------------
+    # Tara (basal / no-contact reference)
+    # ------------------------------------------------------------------
+
+    def _on_tara_clicked(self):
+        """
+        Records the CURRENT tracked position (position_session.position
+        — the same value the joystick's manual nudges keep in sync, see
+        InitialPositionSession.apply_manual_delta) as the "no contact"
+        basal reference for the loaded ensayo. Confirms before
+        overwriting an existing tara (the "corrección futura" flow) —
+        tara_library.save_tara() itself always overwrites
+        unconditionally, so this confirmation is the only thing
+        standing between a mis-tap and losing the previous reference.
+        """
+        if self._ensayo_trajectory_id is None:
+            self.info_label.setText("Carga un ensayo antes de registrar su tara.")
+            return
+        position = self._position_session.position
+        if position is None:
+            self.info_label.setText("No hay una posición actual registrada.")
+            return
+
+        if tara_library.has_tara(self._ensayo_trajectory_id):
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Question)
+            box.setWindowTitle("Actualizar Tara")
+            box.setText(
+                f"Ya existe una tara guardada para "
+                f"'{self._ensayo_trajectory_id}'. ¿Deseas reemplazarla con "
+                f"la posición actual (Y={position.y:.2f}cm, "
+                f"Á={position.angle:.1f}°)? El historial de pruebas ya "
+                f"registrado se conserva."
+            )
+            update_btn = box.addButton("Actualizar", QMessageBox.AcceptRole)
+            box.addButton("Cancelar", QMessageBox.RejectRole)
+            box.exec()
+            if box.clickedButton() is not update_btn:
+                return
+
+        tara_library.save_tara(self._ensayo_trajectory_id, position)
+        self.info_label.setText(
+            f"Tara guardada para '{self._ensayo_trajectory_id}' "
+            f"(Y={position.y:.2f}cm, Á={position.angle:.1f}°)."
+        )
+        self._refresh_tara_label()
+
+    def _refresh_tara_label(self):
+        sm = self._bridge.state_machine
+        self.tara_button.setEnabled(
+            sm.can_run()
+            and self._ensayo_trajectory_id is not None
+            and self._position_session.position is not None
+        )
+        if self._ensayo_trajectory_id is None:
+            self.tara_label.setText("Carga un ensayo para ver/registrar su tara.")
+            return
+        record = self._load_tara_for_current_ensayo()
+        if record is None:
+            self.tara_label.setText(
+                f"'{self._ensayo_trajectory_id}': sin tara registrada."
+            )
+            return
+        self.tara_label.setText(
+            f"Tara '{self._ensayo_trajectory_id}': "
+            f"Y={record.tara.y:.2f}cm  Á={record.tara.angle:.1f}°  "
+            f"({len(record.pruebas)} prueba(s) registrada(s))"
+        )
+
     def _on_run_clicked(self):
+        sm = self._bridge.state_machine
+        tara_record = self._load_tara_for_current_ensayo()
+
+        if tara_record is None:
+            # No tara on record for this ensayo — unchanged behavior
+            # (Luis's explicit choice: this flow is opt-in per CSV, via
+            # the Tara button, not mandatory).
+            self._clear_plot()
+            self._begin_plot_session()
+            self._run_action(sm.run, success_message="Running...")
+            return
+
+        def do_run_with_detach():
+            # Detach-and-reapproach FIRST (see perform_pre_run_detach) —
+            # its own TRAJ_BEGIN overwrites whatever Load && Send
+            # already stored on the ESP32, so the ensayo must be
+            # resent (_send_and_check) afterward, same reasoning as
+            # do_restart() below re-sending after safe_return_to_position.
+            sm.perform_pre_run_detach(tara_record.tara)
+            # The Y the operator actually left the rig at before Run —
+            # exactly where perform_pre_run_detach() lands back at —
+            # is the contact-test value Luis wants on record.
+            tara_library.add_prueba(self._ensayo_trajectory_id, sm.get_position().y)
+            self._send_and_check()
+            self._begin_plot_session()
+            sm.run()
+
         self._clear_plot()
-        self._begin_plot_session()
-        self._run_action(self._bridge.state_machine.run, success_message="Running...")
+        self.info_label.setText("Despegando de la plataforma de fuerza...")
+        self._run_action(
+            do_run_with_detach,
+            success_message="Running...",
+            min_duration_ms=3000,
+        )
+
+    def _load_tara_for_current_ensayo(self):
+        """None if no ensayo is loaded, or none has a tara on record."""
+        if self._ensayo_trajectory_id is None:
+            return None
+        try:
+            return tara_library.load_tara(self._ensayo_trajectory_id)
+        except tara_library.TaraNotFoundError:
+            return None
 
     def _on_pause_clicked(self):
         self._run_action(self._bridge.state_machine.pause, success_message="Paused.")
@@ -858,6 +997,19 @@ class TrajectoryScreen(QWidget):
             if was_paused:
                 sm.abort()
             sm.safe_return_to_position(target, floor_y)
+            # Same detach-before-run rule as a plain Run (see
+            # _on_run_clicked) — applied on EVERY repetition, not just
+            # the first: safe_return_to_position() above already
+            # brings the rig back down to `target` (the same
+            # contact-test Y as before), so skipping this here would
+            # reintroduce the exact "Run starts already in contact"
+            # problem on every leg of a repeat sequence.
+            tara_record = self._load_tara_for_current_ensayo()
+            if tara_record is not None:
+                sm.perform_pre_run_detach(tara_record.tara)
+                tara_library.add_prueba(
+                    self._ensayo_trajectory_id, sm.get_position().y
+                )
             self._send_and_check()
             self._begin_plot_session()
             sm.run()
@@ -1230,3 +1382,5 @@ class TrajectoryScreen(QWidget):
         )
         self.restart_trial_button.setEnabled(can_retry)
         self.choose_other_button.setEnabled(can_retry)
+
+        self._refresh_tara_label()
