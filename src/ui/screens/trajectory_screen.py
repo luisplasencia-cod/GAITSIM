@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox
 )
 
-from src.communication.protocol import TrajectoryPoint
+from src.communication.protocol import Position, TrajectoryPoint
 from src.controllers import tara_library
 from src.controllers.initial_position_session import InitialPositionSession
 from src.ui.action_worker import ActionWorker as _ActionWorker
@@ -44,7 +44,7 @@ from src.ui.style import (
     COLOR_AXIS_X, COLOR_AXIS_Y, COLOR_AXIS_ANGLE,
     COLOR_BG, COLOR_TEXT, COLOR_TEXT_MUTED, COLOR_DANGER,
 )
-from src.utils import position_library
+from src.utils import position_library, trajectory_generator
 from src.utils.trajectory_library import list_trajectories, load_trajectory_by_id
 from src.controllers.system_state import TrajectorySpeedExceededError
 from src.utils.trajectory_validator import TrajectoryOutOfRangeError, validate_trajectory
@@ -269,6 +269,19 @@ class TrajectoryScreen(QWidget):
         row.addWidget(self.send_button)
         select_layout.addLayout(row)
 
+        # Purely visual read-out (2026-09-18, Luis's explicit request:
+        # "para confirmar, nada más") of the loaded ensayo's own
+        # recorded first-row angle — the value the angle-alignment leg
+        # (see _send_and_check) actually rotates the platform to on
+        # Load && Send. No interaction, just confirmation — updated in
+        # _on_send_clicked, reset to "—" whenever nothing valid is
+        # loaded.
+        self.csv_angle_label = QLabel("Ángulo inicial CSV: —")
+        self.csv_angle_label.setStyleSheet(
+            f"font-size: {FONT_SIZE_NORMAL}px; color: {COLOR_TEXT_MUTED()};"
+        )
+        select_layout.addWidget(self.csv_angle_label)
+
         # Max per-axis speed the just-sent (or just-rejected — see
         # TrajectorySpeedExceededError) trajectory actually implies —
         # added 2026-09-01 alongside the speed safety gate in
@@ -290,12 +303,13 @@ class TrajectoryScreen(QWidget):
         sidebar.addWidget(select_box, stretch=0 if self._LIVE_PLOT_VISIBLE else 1)
 
         # --- Tara (referencia basal, pruebas de contacto) ---
-        # See _on_tara_clicked/perform_pre_run_detach: records the
-        # current (y, angle) as the "no contact" reference for the
-        # loaded ensayo, so Run can automatically detach-and-reapproach
-        # before executing it whenever the operator has since lowered Y
-        # to a contact-test height. One tara per CSV (tara_library.py),
-        # updatable (the button re-prompts before overwriting).
+        # See _on_tara_clicked/_send_and_check's detach_tara param:
+        # records the current (y, angle) as the "no contact" reference
+        # for the loaded ensayo, so Run can automatically fuse a
+        # detach-and-reapproach hop onto the ensayo before executing it
+        # whenever the operator has since lowered Y to a contact-test
+        # height. One tara per CSV (tara_library.py), updatable (the
+        # button re-prompts before overwriting).
         tara_box = QGroupBox("TARA (REFERENCIA BASAL)")
         tara_layout = QVBoxLayout(tara_box)
         self.tara_label = QLabel("Carga un ensayo para ver/registrar su tara.")
@@ -632,6 +646,7 @@ class TrajectoryScreen(QWidget):
         trajectory_id = self.trajectory_combo.currentText()
         if not trajectory_id or trajectory_id.startswith("("):
             self.info_label.setText("No valid trajectory selected.")
+            self.csv_angle_label.setText("Ángulo inicial CSV: —")
             return
 
         try:
@@ -640,6 +655,7 @@ class TrajectoryScreen(QWidget):
             self.info_label.setText(f"Failed to load '{trajectory_id}': {exc}")
             self._ensayo_trajectory = None
             self._ensayo_trajectory_id = None
+            self.csv_angle_label.setText("Ángulo inicial CSV: —")
             return
 
         # Stretch the whole recorded timeline by the chosen factor
@@ -657,6 +673,9 @@ class TrajectoryScreen(QWidget):
             for p in loaded
         ]
         self._ensayo_trajectory_id = trajectory_id
+        self.csv_angle_label.setText(
+            f"Ángulo inicial CSV: {self._ensayo_trajectory[0].angle:.1f}°"
+        )
         self._refresh_tara_label()
         # Whatever position the PREVIOUS trajectory (if any) was sent
         # for is no longer relevant — Run stays blocked until THIS one
@@ -701,7 +720,7 @@ class TrajectoryScreen(QWidget):
             return False
         return True
 
-    def _send_and_check(self):
+    def _send_and_check(self, detach_tara: Position = None):
         """
         Runs on the background thread. Validates every point of the
         fully-offset trajectory against the calibrated movement space
@@ -712,8 +731,41 @@ class TrajectoryScreen(QWidget):
         data with no guarantee of staying within a straight line
         between two already-valid endpoints, so every point (not just
         the ends) must be checked individually. This is the single
-        choke point both "Load && Send" and "Reiniciar Ensayo" go
-        through, so neither can bypass the check.
+        choke point "Load && Send", "Reiniciar Ensayo", AND Run-with-
+        detach (see below) all go through, so none can bypass the check.
+
+        detach_tara: when given (Run/Reiniciar Ensayo with a tara on
+        record for this ensayo), FUSES a platform-detach hop directly
+        onto the ensayo's points into ONE trajectory/ONE transfer (see
+        trajectory_generator.generate_detach_and_ensayo_trajectory()'s
+        docstring for the full reasoning) instead of the old two-
+        trajectory sequence (SystemStateMachine.perform_pre_run_detach(),
+        removed 2026-09-18) — that version sent/ran the hop, blocked
+        until it physically finished, and only THEN transferred the
+        ensayo as a SEPARATE trajectory, leaving a real dead pause on
+        the rig for however long that second transfer took. The hop's
+        own duration is now computed from MAX_SPEED_X_CM_S/_Y_CM_S
+        directly (fastest safe pace) rather than the ensayo's own
+        time_scale-stretched one (revised 2026-09-18, same day: sharing
+        time_scale made a 1cm hop feel "bastante lento" at the default
+        30x) — since the combined trajectory is still sent TIMED, it's
+        also still subject to that same ceiling as a backstop.
+
+        ALSO fuses an angle-alignment leg ahead of everything else
+        (2026-09-18, unconditional — not gated by `detach_tara`) so the
+        platform physically rotates to `self._ensayo_trajectory`'s own
+        recorded first-row angle before the ensayo (or the detach hop,
+        if present) begins — see
+        trajectory_generator.generate_angle_alignment_trajectory()'s
+        docstring for why. A no-op (no leg generated at all) if the
+        current angle already matches closely enough. When it DOES
+        rotate, `_offset_points()` is called with an `effective_position`
+        override (same x/y, angle = the ensayo's own target) instead of
+        `self._position_session.position` directly, and the detach
+        hop's own `current` (when both are present) is taken from
+        where the alignment leg ends, NOT the platform's real position
+        right now — otherwise the hop would detach/reapproach at the
+        OLD angle instead of the ensayo's.
 
         send_trajectory() itself does not raise on a failed transfer
         (it returns a result object) — we raise here so the worker's
@@ -730,14 +782,42 @@ class TrajectoryScreen(QWidget):
         FAST to get to from wherever the platform actually is.
         """
         sm = self._bridge.state_machine
-        points = self._offset_points(self._ensayo_trajectory)
-
         space = sm.last_calibration_space
         if space is None:
             raise RuntimeError(
                 "No hay datos de calibración disponibles; no se puede "
                 "validar el ensayo."
             )
+
+        align_leg = []
+        effective_position = self._position_session.position
+        if self._ensayo_trajectory and effective_position is not None:
+            target_angle = self._ensayo_trajectory[0].angle
+            align_leg = trajectory_generator.generate_angle_alignment_trajectory(
+                sm.get_position(), target_angle,
+                self.time_scale_spinbox.value(), space,
+            )
+            if align_leg:
+                effective_position = Position(
+                    effective_position.x, effective_position.y, target_angle,
+                )
+
+        points = self._offset_points(self._ensayo_trajectory, effective_position)
+
+        if detach_tara is not None:
+            detach_current = (
+                Position(align_leg[-1].x, align_leg[-1].y, align_leg[-1].angle)
+                if align_leg else sm.get_position()
+            )
+            points = trajectory_generator.generate_detach_and_ensayo_trajectory(
+                detach_current, detach_tara.y,
+                sm.DETACH_LIFT_ABOVE_TARA_CM, sm.DETACH_X_SHIFT_CM,
+                points, sm.MAX_SPEED_X_CM_S, sm.MAX_SPEED_Y_CM_S, space,
+            )
+
+        if align_leg:
+            points = trajectory_generator.stitch_trajectories([align_leg, points])
+
         try:
             validate_trajectory(points, space)
         except TrajectoryOutOfRangeError as exc:
@@ -745,7 +825,9 @@ class TrajectoryScreen(QWidget):
 
         # The CSV/gait ensayo IS real recorded gait timing — the one
         # case that needs the TIMED TRAJ_POINT form (see docs/protocol.md,
-        # "Cambio 2026-08-31 (TRAJ_POINT sin tiempo)").
+        # "Cambio 2026-08-31 (TRAJ_POINT sin tiempo)"). The fused detach
+        # hop (when present) rides along on the SAME timed send — see
+        # detach_tara's docstring above for why that's now correct.
         try:
             result = sm.send_trajectory(points, timed=True)
         except TrajectorySpeedExceededError as exc:
@@ -762,13 +844,25 @@ class TrajectoryScreen(QWidget):
         # stale again, requiring a fresh Load && Send before Run unlocks.
         self._ensayo_sent_for_position = self._position_session.position
 
-    def _offset_points(self, points):
+    def _offset_points(self, points, position=None):
         """
         Shift the WHOLE loaded trajectory so its own FIRST point lands
-        exactly on the initial position set up in ConnectionScreen
-        (GOTO already moved the rig there) — the offset on every axis
-        (X, Y, AND angle) is computed relative to the trajectory's own
-        first point, not just added on top of the initial position.
+        exactly on `position` (defaults to
+        `self._position_session.position`, the initial position set up
+        in ConnectionScreen — GOTO already moved the rig there) — the
+        offset on every axis (X, Y, AND angle) is computed relative to
+        the trajectory's own first point, not just added on top of the
+        initial position.
+
+        `position` accepts an override (see _send_and_check's
+        angle-alignment leg, 2026-09-18): when the ensayo's own
+        starting angle is about to be reached for real via a fused
+        alignment leg, the OFFSET math needs to already assume that
+        angle rather than whatever stale value
+        `self._position_session.position.angle` still holds at the
+        moment this runs (the alignment hasn't physically happened
+        yet — it's part of the SAME trajectory being built). X/Y are
+        unaffected either way.
 
         Bug fixed here (2026-07-25): the old formula (`p.axis +
         position.axis`, no subtraction) implicitly assumed each CSV's
@@ -788,7 +882,8 @@ class TrajectoryScreen(QWidget):
         points are sent as-is (same as before — there's no "current
         position" to reference against, or nothing to reference).
         """
-        position = self._position_session.position
+        if position is None:
+            position = self._position_session.position
         if position is None or not points:
             return points
         first = points[0]
@@ -885,27 +980,22 @@ class TrajectoryScreen(QWidget):
             return
 
         def do_run_with_detach():
-            # Detach-and-reapproach FIRST (see perform_pre_run_detach) —
-            # its own TRAJ_BEGIN overwrites whatever Load && Send
-            # already stored on the ESP32, so the ensayo must be
-            # resent (_send_and_check) afterward, same reasoning as
-            # do_restart() below re-sending after safe_return_to_position.
-            sm.perform_pre_run_detach(tara_record.tara)
-            # The Y the operator actually left the rig at before Run —
-            # exactly where perform_pre_run_detach() lands back at —
-            # is the contact-test value Luis wants on record.
-            tara_library.add_prueba(self._ensayo_trajectory_id, sm.get_position().y)
-            self._send_and_check()
+            # Detach hop + ensayo FUSED into one send/run (2026-09-18,
+            # see _send_and_check's detach_tara param and
+            # trajectory_generator.generate_detach_and_ensayo_trajectory) —
+            # no separate blocking detach move before this anymore, so
+            # there's no gap between "the hop finishes" and "the ensayo
+            # starts" for a second transfer to sit in. The tara's own Y
+            # (where the whole combined run starts/detaches from) is the
+            # contact-test value Luis wants on record.
+            tara_library.add_prueba(self._ensayo_trajectory_id, tara_record.tara.y)
+            self._send_and_check(detach_tara=tara_record.tara)
             self._begin_plot_session()
             sm.run()
 
         self._clear_plot()
-        self.info_label.setText("Despegando de la plataforma de fuerza...")
-        self._run_action(
-            do_run_with_detach,
-            success_message="Running...",
-            min_duration_ms=3000,
-        )
+        self.info_label.setText("Enviando despegue + ensayo...")
+        self._run_action(do_run_with_detach, success_message="Running...")
 
     def _load_tara_for_current_ensayo(self):
         """None if no ensayo is loaded, or none has a tara on record."""
@@ -997,20 +1087,20 @@ class TrajectoryScreen(QWidget):
             if was_paused:
                 sm.abort()
             sm.safe_return_to_position(target, floor_y)
-            # Same detach-before-run rule as a plain Run (see
-            # _on_run_clicked) — applied on EVERY repetition, not just
-            # the first: safe_return_to_position() above already
-            # brings the rig back down to `target` (the same
-            # contact-test Y as before), so skipping this here would
-            # reintroduce the exact "Run starts already in contact"
-            # problem on every leg of a repeat sequence.
+            # Same fused detach-before-run rule as a plain Run (see
+            # _on_run_clicked/_send_and_check's detach_tara param) —
+            # applied on EVERY repetition, not just the first:
+            # safe_return_to_position() above already brings the rig
+            # back down to `target` (the same contact-test Y as
+            # before), so skipping this here would reintroduce the
+            # exact "Run starts already in contact" problem on every
+            # leg of a repeat sequence.
             tara_record = self._load_tara_for_current_ensayo()
             if tara_record is not None:
-                sm.perform_pre_run_detach(tara_record.tara)
-                tara_library.add_prueba(
-                    self._ensayo_trajectory_id, sm.get_position().y
-                )
-            self._send_and_check()
+                tara_library.add_prueba(self._ensayo_trajectory_id, tara_record.tara.y)
+                self._send_and_check(detach_tara=tara_record.tara)
+            else:
+                self._send_and_check()
             self._begin_plot_session()
             sm.run()
 

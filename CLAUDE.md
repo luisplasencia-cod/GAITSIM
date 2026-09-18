@@ -752,6 +752,366 @@ gait trajectory (and its force trace) with contact already established.
   the ensayo genuinely resumes smoothly after the re-send) and
   explicitly confirmed.
 
+**Implemented (2026-09-18): height-variability/repeatability test
+matrix — replaces the "Pruebas" screen entirely (Luis's explicit
+choice).** Design confirmed with Luis before implementing (per this
+file's Confirmation protocol: talla is read from each ensayo CSV's
+filename via the existing "talla<N>" convention, current example CSVs
+are NOT the definitive set; success = FINISHED with no ERROR and no
+PAUSE/interruption during that specific point). Code-only, offscreen-
+verified only (PySide6 IS available in this session, unlike 2026-09-14
+— see below) — NOT yet tested on real hardware.
+- Matrix shape: 10 columns (talla, 162-180cm step 2cm —
+  `VariabilityMatrixScreen.TALLAS_CM`) x 6 rows (depth below tara,
+  `variability_library.DEPTH_ROWS_MM = (0, -1, -2, -3, -4, -5)` mm —
+  row 0 is the tara itself). Each cell holds up to
+  `SAMPLES_PER_CELL=5` repeatability samples.
+- `src/utils/trajectory_library.py`: new `parse_talla_cm(trajectory_id)`
+  — regex `talla(\d+)` on the id, matching the naming already used by
+  every ensayo CSV on disk (e.g. `Control_apoyo_talla162_montaje35`).
+- `src/utils/trajectory_generator.py`: new
+  `generate_variability_point_trajectory(current, tara, depth_cm,
+  calibration_space)` — 2 synchronized legs (current -> tara, then
+  tara -> tara.y+depth_cm), same "always approach from the same
+  reference" reasoning as `generate_detach_trajectory`'s return leg,
+  so repeats/depths stay comparable. Only the final target is
+  validated against `calibration_space`. Sent/run through the SAME
+  existing untimed TRAJ_BEGIN/TRAJ_POINT/TRAJ_END+RUN protocol — no
+  wire/firmware changes, same pattern as every generated trajectory
+  before it.
+- `SystemStateMachine.perform_variability_point(tara, depth_mm)` (new
+  `VariabilityPointResult` dataclass: `y_real`, `success`,
+  `interrupted`, `error_code`) — unlike
+  `perform_pre_run_detach()`/`safe_return_to_position()`, this does
+  NOT just block on `on_trajectory_finished`: it also temporarily
+  hooks `on_device_error` (an error never fires
+  `on_trajectory_finished`, so blocking on that alone would hang
+  forever) and polls `_state` for PAUSED then IDLE-without-FINISHED
+  (an abort after a pause ALSO never fires `on_trajectory_finished` —
+  see `abort()`'s own docstring) instead of a single blocking wait, so
+  a mid-point pause/abort/error is detected and recorded as a failed
+  sample rather than hanging the app. Both callbacks are saved/
+  restored around the call, same technique `_run_trajectory_blocking()`
+  already used for `on_trajectory_finished` alone.
+- New `src/controllers/variability_library.py` (mirrors
+  tara_library.py's one-file-per-trajectory-id convention, under
+  `data/variabilidad/`) — `load_matrix()`/`add_sample()`. One-time
+  migration: if no matrix file exists yet but tara_library.py already
+  has legacy flat "pruebas" for that id (recorded before this matrix
+  existed, always implicitly at the tara itself), they're migrated
+  into row 0 (marked successful) so the real samples Luis captured on
+  hardware earlier today (talla162, 10 pruebas) don't disappear from
+  the app — only persisted to disk if there was actually something to
+  migrate.
+- New `src/ui/screens/variability_matrix_screen.py`
+  (`VariabilityMatrixScreen`) — replaces `tara_history_screen.py`
+  (deleted; no longer referenced anywhere) in `main_window.py`'s
+  QStackedWidget index 2 / nav button (relabeled "Matriz de Pruebas").
+  Unlike the old read-only screen, this one needs the shared bridge
+  (executing a point is a real blocking device action, same
+  `_ActionWorker`-on-background-thread pattern as TrajectoryScreen).
+  Grid cells color-coded (gray=sin datos, neutral=parcial, verde=5/5
+  sin fallos, rojo=incluye algún fallo); selecting a cell shows its
+  recorded samples and an "Ejecutar punto" button (enabled only while
+  idle AND that talla has both a CSV and a tara on record) that runs
+  one more sample — the same action re-runs a specific saved point on
+  demand, satisfying Luis's "poder seleccionar esa fila/columna y
+  volver a ejecutar el ensayo guardado para ese punto". Export to
+  Excel reuses the same pandas/openpyxl mechanism as the old screen.
+- Verified OFFSCREEN this session (PySide6 available here, unlike
+  2026-09-14's dev environment): generator geometry + out-of-range
+  rejection; `parse_talla_cm` regex; `variability_library` round-trip
+  + legacy migration + invalid-row rejection; `perform_variability_point`
+  against a fake controller for 4 scenarios (normal FINISHED, device
+  ERROR, pause-then-abort, rejected while not IDLE) confirming the
+  right `success`/`interrupted`/`error_code` each time AND that the
+  bridge's own `on_trajectory_finished`/`on_device_error` are restored
+  afterward (no permanent hook leak, no spurious
+  `bridge.trajectory_finished` Qt signal for this internal move); the
+  full `MainWindow` constructed with the new screen wired in and
+  navigated to via its nav button; an offscreen screenshot of
+  `VariabilityMatrixScreen` itself with realistic mixed data (5/5
+  success, partial, a failure, an ensayo with no tara, a talla with no
+  CSV) — colors/text/detail-panel/samples-table all rendered as
+  intended, "Sin CSV"/"Sin tara" shortened to "—" with a tooltip after
+  the initial render showed the full text clipping in the narrow
+  10-column layout.
+- NOT tested on real hardware: whether a real mid-run PAUSE/ABORT is
+  actually observed by the polling loop in time (only exercised via a
+  simulated state transition here, not a real ESP32 exchange), and the
+  whole feature end-to-end per this file's Confirmation protocol.
+- Talla CSVs 164/166/168/170/172/174/176/178/180 still not uploaded as
+  of this note (Luis's explicit confirmation, 2026-09-18) — only
+  162/165/175/185 exist, none matching the matrix's own 2cm-step
+  columns exactly except 162. Guide by the "talla<N>" filename
+  convention when they arrive; current files are examples, not
+  definitive.
+
+**Implemented (2026-09-18, later same session): fused detach+ensayo
+trajectory — eliminates the dead pause between the platform-detach hop
+and the real ensayo starting.** Luis's explicit request: the gap he
+observed between "lift 1cm off tara + shift back/forward" and the
+gait trajectory actually starting had to disappear or become
+imperceptible. Root cause (confirmed, not guessed): the OLD flow
+(`SystemStateMachine.perform_pre_run_detach()`) sent/ran the hop as
+its OWN untimed trajectory, blocked until it physically finished, and
+ONLY THEN transferred the whole ensayo CSV (TRAJ_BEGIN + every
+TRAJ_POINT + ACK + TRAJ_END, potentially hundreds of points over
+115200-baud serial) before calling RUN again — that second transfer's
+wall-clock time was the visible dead pause, with the platform just
+sitting still. `can_send_trajectory()` requires IDLE, so the ensayo
+could not be pre-loaded during the hop's own RUNNING window either
+(the hop's own TRAJ_BEGIN would have clobbered it anyway).
+- Fix: hop + ensayo now travel as ONE continuous trajectory, ONE
+  TRAJ_BEGIN, ONE RUN — no second transfer sits between them at all,
+  so the gap is eliminated by construction, not just shortened.
+- Luis's explicit requirement on HOW: the hop's own timing must use
+  the SAME time-scale factor already applied to the ensayo's CSV
+  timeline (`TrajectoryScreen.time_scale_spinbox`, default 30x) —
+  otherwise the hop (independent placeholder speed) and the ensayo
+  (scaled 30x slower) would move at wildly inconsistent speeds despite
+  being one continuous motion.
+- `trajectory_generator._interpolate()` gained an optional
+  `time_scale: float = 1.0` param (multiplies the computed duration;
+  default preserves every other caller's exact behavior unchanged —
+  synchronized/safe-return/variability-point generation don't pass it).
+- `generate_detach_trajectory()` REMOVED, replaced by
+  `generate_detach_and_ensayo_trajectory(current, tara_y,
+  lift_above_tara_cm, x_shift_cm, ensayo_points, time_scale,
+  calibration_space)` — builds the same 2-leg hop as before (now
+  honoring `time_scale`), then appends `ensayo_points` directly onto
+  the same continuous point list (`_append_phase`, same de-dup as
+  every other multi-phase generator here).
+- `SystemStateMachine.perform_pre_run_detach()` REMOVED (dead after
+  the fusion — its only 2 callers, both in trajectory_screen.py, now
+  build the fused trajectory instead). `DETACH_LIFT_ABOVE_TARA_CM`/
+  `DETACH_X_SHIFT_CM` constants kept (still Luis's fixed 1.0cm margins,
+  now read directly by `TrajectoryScreen._send_and_check()`).
+- `TrajectoryScreen._send_and_check()` gained an optional `detach_tara`
+  param: when given, builds the fused trajectory via
+  `generate_detach_and_ensayo_trajectory()` (passing
+  `time_scale_spinbox.value()`) BEFORE the existing
+  `validate_trajectory()`/`send_trajectory(timed=True)` calls — same
+  single choke point as before, now also covering the hop. Both
+  `_on_run_clicked`'s `do_run_with_detach()` and `_restart_trial`'s
+  `do_restart()` updated to call `_send_and_check(detach_tara=
+  tara_record.tara)` instead of the old separate
+  `perform_pre_run_detach()` + resend sequence; the recorded "prueba"
+  Y is now the tara's own Y (where the fused run starts from) rather
+  than a post-move GET_POSITION readout, since there's no longer an
+  intermediate blocking step to measure between. `do_run_with_detach`'s
+  `min_duration_ms=3000` padding was removed (it existed only to keep
+  the old "Despegando..." label readable during the old blocking hop,
+  which no longer exists as a separate step); `do_restart`'s
+  `min_duration_ms=3000` on `safe_return_to_position()`'s own label is
+  UNCHANGED — that's a separate, still-real blocking move, out of
+  scope for this fix.
+- Side effect Luis should know about, not yet asked about: the live
+  trajectory plot will now show the hop's own small lift/shift motion
+  at the very start of a Run/Reiniciar Ensayo with a tara on record
+  (TRAJ_PROGRESS has no way to distinguish "hop" from "ensayo" once
+  they're one trajectory) — previously the hop was invisible to the
+  plot (untimed, separate, plot session began only after it). Not
+  filtered out; flag if it reads confusingly on the real plot.
+- Verified OFFSCREEN only: fused-trajectory geometry (starts at
+  `current`, hop returns to `current` before the ensayo continues,
+  ensayo's own t=0 boundary de-duped, strictly increasing t, ends
+  exactly on the ensayo's own last point); `time_scale` scaling
+  linearly (30x hop takes ~30x longer than 1x); and — the specific
+  safety check this change interacts with — confirmed a low time_scale
+  (1x) now correctly gets REJECTED by the existing
+  `TrajectorySpeedExceededError` gate (the hop's placeholder Y speed,
+  5cm/s, exceeds the real `MAX_SPEED_Y_CM_S`=3.9cm/s ceiling at 1x)
+  while the real default (30x) is correctly ACCEPTED — this is
+  precisely why sharing `time_scale` with the ensayo matters, not just
+  a cosmetic choice. NOT tested on real hardware: whether the fused
+  hop+ensayo actually FEELS continuous on the rig, and whether the
+  plot side effect above is acceptable as-is.
+- Note for next session: `main.py` was observed running (PID from a
+  live process, started 16:12) DURING this same session, already on
+  the pre-fusion code — it will not pick up this change until
+  restarted.
+
+**Implemented (2026-09-18, later same session): angle auto-alignment
+to the loaded ensayo's own recorded starting angle.** Luis's explicit
+request: he shouldn't have to manually type a matching angle at "Ir a
+Posición Inicial" — the operator's typed value was what actually
+determined the ensayo's real starting angle (see `_offset_points()`'s
+existing OFFSET design, 2026-07-25), with the CSV's own recorded first
+angle only ever used as a relative reference, never reached for real
+unless it happened to match by luck. Luis's explicit choice on timing:
+correct for ANY real difference (with a negligible-move tolerance),
+not just large ones, and the correction happens "al cargar la
+trayectoria" (Load && Send time), not before.
+- New `trajectory_generator.generate_angle_alignment_trajectory(current,
+  target_angle, time_scale, calibration_space)` — a single angle-only
+  synchronized leg (X/Y untouched), empty (no-op) if already within
+  `_interpolate`'s existing negligible-move threshold. Same
+  `time_scale` reasoning as `generate_detach_and_ensayo_trajectory`
+  (2026-09-18, earlier this session) — kept consistent so the leg
+  moves at a coherent speed and is checked against
+  `MAX_SPEED_ANGLE_DEG_S` once sent TIMED.
+- New `trajectory_generator.stitch_trajectories(phases)` — a small
+  public wrapper around the `_append_phase` stitching every multi-leg
+  generator in this module already used internally, so
+  `TrajectoryScreen._send_and_check()` can compose the (independently
+  generated) alignment leg ahead of whatever it already builds
+  (plain offset ensayo, or the fused detach+ensayo) without reaching
+  into private internals.
+- `TrajectoryScreen._offset_points()` gained an optional `position`
+  override param (default: `self._position_session.position`,
+  unchanged behavior for every existing call site) — needed because at
+  the moment offsetting runs, the alignment leg hasn't physically
+  happened yet (it's part of the SAME trajectory being built), so the
+  offset math needs to already ASSUME the ensayo's own target angle
+  rather than the stale value `_position_session.position.angle` still
+  holds.
+- `_send_and_check()` (the single choke point for Load && Send,
+  Reiniciar Ensayo, AND Run-with-detach — see 2026-09-18's earlier
+  fusion entry) now builds this alignment leg UNCONDITIONALLY (not
+  gated by a tara), before everything else: real current position ->
+  ensayo's own first-row angle. When a detach hop is ALSO being fused
+  (`detach_tara` given), its own `current` is taken from where the
+  alignment leg ENDS, not the platform's stale real position — so the
+  hop detaches/reapproaches at the ALREADY-CORRECTED angle, not the
+  old one. Final order when everything is active: align -> detach hop
+  -> ensayo, all ONE trajectory, ONE TRAJ_BEGIN, ONE RUN — same "no
+  extra transfer, no extra gap" property as the detach fusion itself.
+- NOT touched: `_check_ensayo_within_range()` (the UI-thread preview
+  check at Load && Send time, before the background worker even
+  starts) still previews using the OLD plain offset, same
+  pre-existing gap as the detach hop already had — its own docstring
+  already documents it as presentation-only, `_send_and_check()` is
+  the real gate and IS alignment-aware. Not fixed; flagged as a known
+  minor inconsistency, not asked to fix it this session.
+- Verified OFFSCREEN only (pure-function level, mirroring exactly what
+  `_send_and_check()` now does): alignment leg geometry (X/Y
+  untouched, ends at target angle, no-op when already matching, rejects
+  out-of-range); `stitch_trajectories` continuity/de-dup/empty-phase
+  handling; a full scenario with a stale operator angle (5°) vs. a
+  real CSV's first-row angle (-20°) confirming the offset ensayo's
+  angle values pass through UNCHANGED (raw CSV angle, not
+  re-offset) once the alignment leg is accounted for; and that the
+  detach hop's own `current` correctly picks up the ALIGNED angle
+  (not the stale one) when both features are active together. NOT
+  tested on real hardware — same `main.py`-not-yet-restarted caveat as
+  the detach fusion above.
+
+**Implemented (2026-09-18, later still): two follow-up fixes to the
+same-day detach fusion + new variability matrix, both from Luis
+testing/thinking through the design further.**
+1. **Detach hop now moves at "fastest safe" speed instead of the
+   ensayo's own time_scale.** Luis's earlier explicit requirement
+   (same day, "same scale as the CSV load") made a 1cm hop feel
+   "bastante lento" once stretched by the default 30x — he asked for
+   it to stay continuous/fused but move as fast as the rig safely
+   allows, bounded by the real speed limits, not unbounded.
+   `generate_detach_and_ensayo_trajectory()`'s `time_scale` param
+   REPLACED by `max_speed_x_cm_s`/`max_speed_y_cm_s` — new
+   `_fastest_leg()` (mirrors `_interpolate()`'s shape but driven by
+   explicit per-axis ceilings, no time_scale multiplication) computes
+   each leg's duration as `distance / (max_speed * 0.9)`
+   (`_DETACH_HOP_SPEED_SAFETY_MARGIN = 0.9`, headroom against
+   step-rounding pushing the ACTUAL speed a hair over the nominal
+   ceiling). `TrajectoryScreen._send_and_check()` now passes
+   `sm.MAX_SPEED_X_CM_S`/`sm.MAX_SPEED_Y_CM_S` instead of
+   `time_scale_spinbox.value()`. The ensayo's own points (and the
+   angle-alignment leg) are UNCHANGED — still at `time_scale`/fastest-
+   safe respectively as before; only the detach hop's own timing
+   changed. Verified offscreen: computed hop duration matches the
+   fastest-safe formula exactly, is ~20x+ faster than the old 30x-
+   scaled duration for the same 1cm move, and still passes the real
+   `TrajectorySpeedExceededError` ceiling check (the 0.9 margin holds).
+2. **"Ejecutar punto" (variability matrix) now reaches the tara via
+   the SAME safe repositioning sequence as "Reiniciar Ensayo"/"Ir a
+   Posición Inicial"**, instead of a direct diagonal move — Luis's
+   explicit request: a matrix point must be gated by the same physical
+   safety rules as every other repositioning (lift clear by
+   `Y_LIFT_MARGIN_CM`=5cm before X travels, only move X at
+   `ANGLE_REFERENCE_DEG`), not skip them for being a short
+   calibration-style move.
+   `generate_variability_point_trajectory()` gained
+   `lift_margin_cm`/`angle_reference_deg` params — its own leg 1
+   (current -> tara) now delegates to `generate_safe_return_trajectory`
+   (`floor_y = tara.y`) instead of a plain synchronized leg; leg 2 (the
+   actual depth descent, tara -> tara+depth) is unchanged, plain,
+   Y-only. `SystemStateMachine.perform_variability_point()` now passes
+   `self.Y_LIFT_MARGIN_CM`/`self.ANGLE_REFERENCE_DEG` through. Side
+   effect (by design, matches the function's own pre-existing
+   "always approach from the same reference" repeatability
+   philosophy): the lift+descend now runs on EVERY sample, even when
+   already sitting at tara with depth=0, so every repeat takes the
+   exact same physical path. Verified offscreen: Y never drops below
+   `tara.y` while X is still in transit (mirroring
+   `generate_safe_return_trajectory`'s own guarantee), the intentional
+   below-tara descent only happens once already at `tara.x`, and the
+   lift+descend still runs even in the degenerate
+   current==tara/depth==0 case.
+Neither verified on real hardware — same `main.py`-not-yet-restarted
+caveat as everything else built this session.
+
+**Implemented (2026-09-18, later still): CSV initial-angle read-out on
+Monitor's right column.** Luis's explicit request: purely visual, "para
+confirmar, nada más" — no interaction. New
+`TrajectoryScreen.csv_angle_label` in the TRAJECTORY SELECTION box
+(right sidebar), between the Refresh/Load && Send row and the existing
+`speed_label` — shows "Ángulo inicial CSV: —" until a trajectory is
+loaded, then the loaded ensayo's own raw first-row angle (same value
+`_send_and_check`'s angle-alignment leg targets), reset to "—" on a
+failed/invalid load. Verified offscreen: text updates correctly on
+load/reset (checked directly, without needing the background worker to
+finish); a full MainWindow screenshot (welcome screen dismissed,
+navigated to Monitor for real) confirms the label renders in place
+with no layout overlap.
+
+**Implemented (2026-09-18, later still): corrected WHEN a variability-
+matrix sample counts, plus a per-sample delete button.** Luis's
+explicit correction: "Ejecutar punto" only moves the platform to the
+(talla, depth) point — he still has to press Run separately (via
+TrajectoryScreen, on the already-loaded ensayo for that talla) to
+actually execute the trial from there. The repeatability counter had
+been incrementing on the MOVE; it must increment when that SEPARATE
+Run's own trajectory finishes instead.
+- `SystemStateMachine.perform_variability_point()` REPLACED by
+  `go_to_variability_point(tara, depth_mm) -> Position` — now a plain
+  GOTO-style blocking call (reuses `_run_trajectory_blocking`, same as
+  `safe_return_to_position()`), no more device-error/pause polling or
+  `VariabilityPointResult` (both removed) — it has no opinion on
+  success/failure anymore, only gets the platform there.
+- `VariabilityMatrixScreen` now tracks a `_pending_sample` (dict:
+  trajectory_id/depth_mm/y_real/interrupted) set right after a
+  successful "Ejecutar punto". Subscribes to the shared bridge's
+  `trajectory_finished` (records the pending sample as success, unless
+  a pause was observed first), `device_error` (records it as a
+  failure), `state_changed` (marks `interrupted=True` on PAUSED; if it
+  then sees IDLE while already interrupted — a pause-then-abort, which
+  never fires `trajectory_finished`/`device_error` at all — finalizes
+  as failed instead of leaving `_pending_sample` stuck forever), and
+  `disconnected` (drops it silently, no record — nothing meaningful
+  was measured). Known limitation, same as ConnectionScreen's own
+  `_awaiting_initial_move` guard: trusts that the NEXT trajectory to
+  finish while a sample is pending is the intended Run; an unrelated
+  one finishing first would be wrongly attributed. Not solved further
+  — matches an already-accepted risk elsewhere in this app.
+- New `variability_library.delete_sample(trajectory_id, depth_mm,
+  index)` — removes one sample from a row without touching the rest.
+  New per-row "✕" button (5th column, `_SAMPLE_COLUMNS`) in the
+  "PUNTO SELECCIONADO" samples table (Luis's explicit request, "un
+  botón... para poder eliminar ensayo" — interpreted as deleting one
+  mistaken/bad SAMPLE, not a CSV file) — `_on_delete_sample_clicked`.
+- Verified offscreen (mocked controller, simulating the repositioning
+  move's own FINISHED via a background thread, then the SEPARATE
+  ensayo Run's FINISHED/ERROR/pause-abort via direct calls into the
+  state machine): "Ejecutar punto" alone records nothing; the
+  subsequent Run's FINISHED is what records exactly 1 sample; an
+  unrelated FINISHED with nothing pending is a safe no-op; a device
+  error during the Run records a failure; pause-then-abort records a
+  failure instead of hanging; a disconnect drops the pending sample
+  with no record; `delete_sample` removes the right one, rejects an
+  out-of-range index/invalid depth row, and the UI handler wires
+  through correctly. Screenshot confirms the "✕" buttons render
+  cleanly per row. NOT tested on real hardware.
+
 ## Deferred / not built yet (do not build unless explicitly asked)
 GUI polish (splash screen, branding), user management, pathology
 library, automatic reports, Digital Twin, sensor integration beyond

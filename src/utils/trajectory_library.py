@@ -11,11 +11,32 @@ its identifier.
 """
 
 import os
+import re
+from typing import Optional
 
 from src.communication.protocol import TrajectoryPoint
 from src.utils.trajectory_loader import TrajectoryLoadError, load_trajectory
 
 DEFAULT_TRAJECTORIES_DIR = "data/trajectories"
+
+# Matches the "talla<N>" convention already used in every ensayo CSV
+# filename on disk (e.g. "Control_apoyo_talla162_montaje35.csv" ->
+# 162) — used by the height-variability test matrix
+# (variability_library.py) to group ensayos by subject/prosthesis
+# size into matrix columns. Case-insensitive; not every trajectory is
+# expected to match (e.g. "balanceo_v4.csv" has no talla).
+_TALLA_PATTERN = re.compile(r"talla(\d+)", re.IGNORECASE)
+
+
+def parse_talla_cm(trajectory_id: str) -> Optional[int]:
+    """
+    Extract the "talla" (subject/prosthesis height, cm) encoded in a
+    trajectory id's filename, per the existing "talla<N>" naming
+    convention. None if the id doesn't follow that convention (not
+    every ensayo is talla-scoped).
+    """
+    match = _TALLA_PATTERN.search(trajectory_id)
+    return int(match.group(1)) if match else None
 
 
 class TrajectoryNotFoundError(TrajectoryLoadError):

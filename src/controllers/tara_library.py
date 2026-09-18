@@ -3,11 +3,13 @@ tara_library.py
 
 Manages per-ensayo "tara" (basal / no-contact reference) records for
 the force-platform contact-threshold testing workflow (see
-SystemStateMachine.perform_pre_run_detach() and TrajectoryScreen's
-Tara button/history screen). One JSON file per trajectory (CSV) id
-under a directory, mirroring position_library.py's convention —
-{trajectory_id}.json holds that CSV's tara position plus every
-recorded "prueba" (a contact test actually run: the Y height the
+TrajectoryScreen's Tara button/_send_and_check(), which fuses a detach
+hop onto the ensayo via
+trajectory_generator.generate_detach_and_ensayo_trajectory() whenever a
+tara is on record — see that function's docstring). One JSON file per
+trajectory (CSV) id under a directory, mirroring position_library.py's
+convention — {trajectory_id}.json holds that CSV's tara position plus
+every recorded "prueba" (a contact test actually run: the Y height the
 operator descended to before pressing Run).
 
 File shape:
@@ -134,9 +136,10 @@ def add_prueba(
     trajectory_id: str, y: float, directory: str = DEFAULT_TARA_DIR
 ) -> None:
     """
-    Append a contact-test record (the Y value actually run, captured
-    right after SystemStateMachine.perform_pre_run_detach() lands back
-    at it) to `trajectory_id`'s existing tara file.
+    Append a contact-test record (the tara Y the platform detaches from
+    and lands back on before the fused ensayo run — see
+    TrajectoryScreen._send_and_check()) to `trajectory_id`'s existing
+    tara file.
 
     Raises:
         TaraNotFoundError: If no tara exists yet for trajectory_id —
