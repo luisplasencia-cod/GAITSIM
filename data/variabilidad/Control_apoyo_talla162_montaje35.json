@@ -1,62 +1,16 @@
 {
   "rows": {
-    "0": [
-      {
-        "y_real": 9.4,
-        "success": true,
-        "timestamp": "2026-09-18T15:14:45"
-      },
-      {
-        "y_real": 9.4,
-        "success": true,
-        "timestamp": "2026-09-18T15:15:36"
-      },
-      {
-        "y_real": 9.4,
-        "success": true,
-        "timestamp": "2026-09-18T15:16:03"
-      },
-      {
-        "y_real": 9.4,
-        "success": true,
-        "timestamp": "2026-09-18T15:16:30"
-      },
-      {
-        "y_real": 9.4,
-        "success": true,
-        "timestamp": "2026-09-18T15:17:08"
-      },
-      {
-        "y_real": 9.4,
-        "success": true,
-        "timestamp": "2026-09-18T15:17:35"
-      },
-      {
-        "y_real": 9.4,
-        "success": true,
-        "timestamp": "2026-09-18T15:18:02"
-      },
-      {
-        "y_real": 9.4,
-        "success": true,
-        "timestamp": "2026-09-18T15:18:29"
-      },
-      {
-        "y_real": 9.4,
-        "success": true,
-        "timestamp": "2026-09-18T15:18:56"
-      },
-      {
-        "y_real": 9.4,
-        "success": true,
-        "timestamp": "2026-09-18T15:19:23"
-      }
-    ],
+    "0": [],
     "-1": [
       {
         "y_real": 9.3,
         "success": true,
         "timestamp": "2026-09-18T17:34:49"
+      },
+      {
+        "y_real": 9.4,
+        "success": true,
+        "timestamp": "2026-09-21T14:38:03"
       }
     ],
     "-2": [

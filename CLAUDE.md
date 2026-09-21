@@ -1112,6 +1112,36 @@ Run's own trajectory finishes instead.
   through correctly. Screenshot confirms the "✕" buttons render
   cleanly per row. NOT tested on real hardware.
 
+**Implemented (2026-09-21): 5cm lift-off at the END of every ensayo
+(Run and Reiniciar Ensayo).** Luis's explicit request: when the
+trajectory finishes, the platform must rise 5cm immediately ("sin
+delay") to detach from the ground/force platform.
+- Same fusion technique as the 2026-09-18 detach hop: new
+  `trajectory_generator.append_end_lift()` appends a pure-Y leg onto the
+  END of the same timed trajectory (ONE TRAJ_BEGIN, ONE RUN), so the
+  ESP32 goes straight from the ensayo's last point into the lift — no
+  FINISHED-then-second-transfer gap. Fastest-safe timing
+  (`_fastest_leg`, same 0.9 margin as the hop), NOT stretched by
+  `time_scale`; capped at `calibration_space.y_max` (no-op if already
+  there). `SystemStateMachine.END_LIFT_CM = 5.0` (fixed, not UI-
+  configurable, same as the detach constants).
+- Applied in `TrajectoryScreen._send_and_check()` unconditionally (not
+  gated by a tara), so Load && Send, plain Run, Run-with-detach and
+  every leg of a Reiniciar Ensayo repeat sequence all get it. No wire/
+  firmware change (`docs/protocol.md` untouched).
+- Side effects: `FINISHED` (and the matrix's sample recording / repeat-
+  sequence chaining) now arrives ~1.4s after the last CSV point, once
+  the lift completes; the live plot shows the lift as a Y rise at the
+  end (TRAJ_PROGRESS can't tell it apart from the ensayo). Rig ends 5cm
+  above the last ensayo point; `_position_session.position` still holds
+  the INITIAL position (unchanged), and later moves use real
+  `GET_POSITION`, so nothing depends on where the rig ended.
+- Verified OFFSCREEN only: generator geometry (+5cm Y, X/angle
+  unchanged, ensayo points untouched, y_max cap, empty input); the real
+  `_send_and_check()` (plain and with-tara) against a real
+  `SystemStateMachine` speed-ceiling gate with the CSV at 30x. NOT
+  tested on real hardware; `main.py` must be restarted to pick it up.
+
 ## Deferred / not built yet (do not build unless explicitly asked)
 GUI polish (splash screen, branding), user management, pathology
 library, automatic reports, Digital Twin, sensor integration beyond

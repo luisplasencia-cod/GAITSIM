@@ -1007,6 +1007,14 @@ class SystemStateMachine:
     # DETACH_LIFT_ABOVE_TARA_CM.
     DETACH_X_SHIFT_CM = 1.0
 
+    # How far the platform rises, right after a trajectory's last point
+    # and as part of that same trajectory (see
+    # trajectory_generator.append_end_lift), to lift off the force
+    # platform once an ensayo ends. Fixed at 5cm per Luis's explicit
+    # request (2026-09-21); same "not UI-configurable" treatment as
+    # DETACH_LIFT_ABOVE_TARA_CM above.
+    END_LIFT_CM = 5.0
+
     # ------------------------------------------------------------------
     # Height-variability / repeatability test matrix
     # ------------------------------------------------------------------

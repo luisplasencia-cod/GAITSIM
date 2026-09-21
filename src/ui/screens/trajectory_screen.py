@@ -815,6 +815,17 @@ class TrajectoryScreen(QWidget):
                 points, sm.MAX_SPEED_X_CM_S, sm.MAX_SPEED_Y_CM_S, space,
             )
 
+        # Final 5cm lift-off (2026-09-21), fused onto the END of the same
+        # trajectory so the platform rises the instant the ensayo's last
+        # point is reached, with no second transfer/gap — see
+        # trajectory_generator.append_end_lift. Unconditional (not gated
+        # by a tara), since this is the single choke point Load && Send,
+        # a plain Run, Run-with-detach and Reiniciar Ensayo all share.
+        points = trajectory_generator.append_end_lift(
+            points, sm.END_LIFT_CM,
+            sm.MAX_SPEED_X_CM_S, sm.MAX_SPEED_Y_CM_S, space,
+        )
+
         if align_leg:
             points = trajectory_generator.stitch_trajectories([align_leg, points])
 

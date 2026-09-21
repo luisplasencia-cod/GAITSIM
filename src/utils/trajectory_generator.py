@@ -517,6 +517,61 @@ def generate_variability_point_trajectory(
     return stitch_trajectories([safe_leg, descent_leg])
 
 
+def append_end_lift(
+    ensayo_points: List[TrajectoryPoint],
+    lift_cm: float,
+    max_speed_x_cm_s: float,
+    max_speed_y_cm_s: float,
+    calibration_space: CalibrationSpace,
+) -> List[TrajectoryPoint]:
+    """
+    Append a pure-Y "lift off the ground" leg onto the END of
+    `ensayo_points`, as part of the SAME continuous trajectory — Luis's
+    request (2026-09-21): when a Run/Reiniciar Ensayo trajectory ends,
+    the platform must rise `lift_cm` (5cm) immediately, with no delay,
+    to detach from the force platform.
+
+    Fused into the same timed trajectory (rather than a follow-up
+    trajectory sent after FINISHED) for the same reason
+    generate_detach_and_ensayo_trajectory fuses the detach hop: a
+    second TRAJ_BEGIN/TRAJ_POINT/TRAJ_END/RUN exchange would sit between
+    "the ensayo ends" and "the lift starts", and the platform would
+    just stand there for however long it takes. Here the ESP32 goes
+    straight from the ensayo's last point into the lift.
+
+    Timing is the fastest-safe pace (_fastest_leg, same
+    _DETACH_HOP_SPEED_SAFETY_MARGIN headroom as the detach hop), NOT
+    stretched by the ensayo's time_scale — a 5cm lift at e.g. 30x would
+    take minutes, and this is not gait data. Since the trajectory is
+    sent TIMED, SystemStateMachine's per-axis speed ceiling still
+    applies as a backstop.
+
+    The lift target is capped at `calibration_space.y_max` (graceful
+    cap, same pattern as the detach hop's lift_y) — if the ensayo
+    already ends at the top of the range, nothing is appended. Only Y
+    changes; X and angle stay at the ensayo's own last values.
+
+    Returns a NEW list (the input is not mutated). Empty `ensayo_points`
+    is returned unchanged (nothing to lift from).
+    """
+    if not ensayo_points:
+        return list(ensayo_points)
+
+    last = ensayo_points[-1]
+    lifted = Position(
+        last.x, min(last.y + lift_cm, calibration_space.y_max), last.angle,
+    )
+    lift_leg = _fastest_leg(
+        Position(last.x, last.y, last.angle), lifted,
+        max_speed_x_cm_s * _DETACH_HOP_SPEED_SAFETY_MARGIN,
+        max_speed_y_cm_s * _DETACH_HOP_SPEED_SAFETY_MARGIN,
+    )
+
+    points = list(ensayo_points)
+    _append_phase(points, lift_leg, last.t)
+    return points
+
+
 def generate_angle_alignment_trajectory(
     current: Position,
     target_angle: float,
