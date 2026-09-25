@@ -812,7 +812,7 @@ class TrajectoryScreen(QWidget):
             points = trajectory_generator.generate_detach_and_ensayo_trajectory(
                 detach_current, detach_tara.y,
                 sm.DETACH_LIFT_ABOVE_TARA_CM, sm.DETACH_X_SHIFT_CM,
-                points, sm.MAX_SPEED_X_CM_S, sm.MAX_SPEED_Y_CM_S, space,
+                points, sm.HOP_SPEED_X_CM_S, sm.HOP_SPEED_Y_CM_S, space,
             )
 
         # Final 5cm lift-off (2026-09-21), fused onto the END of the same
@@ -823,7 +823,7 @@ class TrajectoryScreen(QWidget):
         # a plain Run, Run-with-detach and Reiniciar Ensayo all share.
         points = trajectory_generator.append_end_lift(
             points, sm.END_LIFT_CM,
-            sm.MAX_SPEED_X_CM_S, sm.MAX_SPEED_Y_CM_S, space,
+            sm.HOP_SPEED_X_CM_S, sm.HOP_SPEED_Y_CM_S, space,
         )
 
         if align_leg:

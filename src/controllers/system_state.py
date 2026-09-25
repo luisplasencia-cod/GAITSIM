@@ -1149,9 +1149,21 @@ class SystemStateMachine:
     # per-point profile that used to require at least a 13x time-scale
     # to stay under this ceiling now only needs 10x (a faster/less-
     # stretched ensayo playback).
-    MAX_SPEED_X_CM_S = 19.5
-    MAX_SPEED_Y_CM_S = 3.9
-    MAX_SPEED_ANGLE_DEG_S = 45.5
+    # TEMPORARY (2026-09-25, Luis's explicit request, for testing): all
+    # three ceilings raised to 60 so the speed gate effectively doesn't
+    # block runs. Previous values: 19.5 / 3.9 / 45.5. Restore them
+    # (real Y stall risk, see vertical_motor_speed_limit_investigation)
+    # once testing is done.
+    MAX_SPEED_X_CM_S = 60.0
+    MAX_SPEED_Y_CM_S = 60.0
+    MAX_SPEED_ANGLE_DEG_S = 60.0
+
+    # Speed ceilings for the fused detach hop and the end-of-ensayo
+    # lift ONLY (2026-09-25). Kept at the previous safe values while
+    # MAX_SPEED_* above is temporarily raised for testing, so those
+    # short moves don't become unbounded-fast.
+    HOP_SPEED_X_CM_S = 19.5
+    HOP_SPEED_Y_CM_S = 3.9
 
     def _build_calibration_space(self, limits: HomeLimits) -> CalibrationSpace:
         """Converts a HOME's raw-step HomeLimits (from
